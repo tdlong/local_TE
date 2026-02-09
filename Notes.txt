@@ -1,0 +1,116 @@
+
+I can just run code line-by-line, but eventually we would just build a bash script that bangs it 
+out if given a REGION and a INPUTBAM.  What I want is working code I can just copy paste into my 
+terminal to run (I will run on the cluster)
+
+As stuff works we will build a script that does it all given a bam and a region
+
+
+module load samtools/1.15.1
+module load SPAdes/3.15.4
+module load ncbi-blast/2.13.0
+module load mafft/7.471
+
+But there may be some conflicts in the packages. so best to load them before you need them and then unload them
+
+REGION="chr3L:8710861-8744900"
+# REGION="chrX:8450000-8500000"
+REF="/dfs7/adl/sruckman/XQTL/XQTL2/ref/dm6_conTE.fa"
+TEFASTA="/dfs7/adl/sruckman/XQTL/XQTL2/ref/transposon_sequence_set.fa"
+INPUTBAM="/dfs7/adl/sruckman/XQTL/XQTL2/data/bam/colorTEcon/HOULE_L2F.bam"
+
+# Extract the reads for your candidate region with one read mapping uniquely
+# extract the region while I am at it
+samtools view -h $INPUTBAM $REGION | \
+ awk '($5 > 20 && ($7 == "*" || $7 != "=" || $5 == 0))' | \
+ samtools view -bS - > candidate_reads.bam
+samtools faidx $REF $REGION > region.fasta
+
+## Sarah says this didn't work, and she had to do this
+I had to change the first line of code since the header was different: 
+samtools view -h HOULE_L2F.bam "$REGION" | \
+  awk 'BEGIN {OFS="\t"} /^@/ {print; next} ($5 > 20 && ($7 == "*" || $7 != "=" || $5 == 0))' | \
+  samtools view -bS - > candidate_reads.bam
+Not sure if this is correct or Not???
+
+I think this may be a better way to extract reads.
+
+samtools view -h -q 10 input.bam $REGION | \
+ awk '\
+   $1 ~ /^@/ {print; next}                       # Headers
+   and($2, 8) || $7 != "=" || $7 == "*" {print}  # Mate unmapped or different chr
+ ' | samtools view -bS - > candidate_reads.bam
+samtools faidx $REF $REGION > region.fasta
+
+What is key is that we extract mate pairs where one read maps uniquely 
+to the region, and the matepair maps non-uniquely or not at all 
+this is the expectation is the read pair spans a TE insertion, as one read maps to
+the region and the other maps to a TE, that may be part of the refernece genome (or 
+may not be), but it location is likely elsewhere, and it could be in serveral copies
+in the genome
+
+# Get read names
+samtools view candidate_reads.bam | cut -f1 | sort -u > read_names.txt
+
+# extract reads
+samtools view -N read_names.txt -o paired_reads.bam input.bam
+
+# Convert to FASTQ
+samtools fastq -1 R1.fq -2 R2.fq -s singleton.fq paired_reads.bam
+
+# Local assembly with SPAdes
+# it is unclear this code worked the first time we tried this
+# the idea is that we will end up with several contigs including
+# ones that have the region and the end of a TE
+# the TE containing reads almost certainly are only a fraction of the total molecules
+# in the library (this is pool sequencing, so the TE is at some frequency say 10%)
+spades.py -1 R1.fq -2 R2.fq -o assembly --careful
+
+# Create a nucleotide BLAST database (using the cannonical set .. I can't remember the file name)
+# teh bast software (ncbi) is the module load that seems to have some sort of conflict with the other
+# modules
+
+makeblastdb -in $TEFASTA \
+ -dbtype nucl \
+ -out drosophila_TE_db \
+ -parse_seqids
+
+# the hope here is to identify a subset of the assembled fragments that appear to map to a TE
+blastn -query assembly/contigs.fasta \
+ -db drosophila_TE_db \
+ -out te_blast_results.tsv \
+ -outfmt "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen" \
+ -evalue 1e-10
+
+# Get list of contigs with TE hits (>90% identity, >100bp)
+awk '$3 > 90 && $4 > 100 {print $1}' te_blast_results.tsv | sort -u > te_hitting_contigs.txt
+
+# Extract those contigs
+# the cluster doesn;t have seqtk, so I want to try the other solution first
+seqtk subseq assembly/contigs.fasta te_hitting_contigs.txt > te_contigs.fasta
+
+# OR if you don't want to mamba seqtk to install
+grep -A1 -Ff te_hitting_contigs.txt assembly/contigs.fasta | grep -v "^--$" > te_contigs.fasta
+
+# Get list of TEs that were hit
+awk '$3 > 90 && $4 > 100 {print $2}' te_blast_results.tsv | sort -u > matching_TEs.txt
+
+# or without seqtk
+grep -A1 -Ff matching_TEs.txt drosophila_TEs.fasta | grep -v "^--$" > matching_TEs.fasta
+
+# Combine all sequences
+# the hope is that we have the sequence for the region without the TE (C = consensus or reference)
+# the flank plus TE on the left (L)
+# the flank plus TE on the right (R; the TE is big enough that we only get the ends)
+# the entire consensus TE (T)
+cat region.fasta te_contigs.fasta matching_TEs.fasta > combined_for_alignment.fasta
+
+# so the align ideally looks like this
+
+CCCCCCCCCCCCCCCCCC------------------------------------CCCCCCCCCCCCCCCCCCCC
+------------------TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT--------------------
+---------LLLLLLLLLLLLLLLLL------------------------------------------------
+-------------------------------------------RRRRRRRRRRRRRRRRRRRR-----------
+
+# align
+mafft --adjustdirection --maxiterate 1000 combined_for_alignment.fasta > alignment.fasta

@@ -1,0 +1,5 @@
+# Temp work / output directories
+temp_work/
+
+# OS files
+.DS_Store
