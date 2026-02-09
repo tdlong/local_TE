@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# TE junction assembly pipeline
+# Phase 1: TE junction assembly pipeline (pooled discovery)
 set -e
 
 #=============================================================================
 # USAGE
 #=============================================================================
 if [ $# -lt 3 ]; then
-    echo "Usage: $0 <region> <bam> <outdir>"
+    echo "Usage: $0 <region> <outdir> <bam1> [bam2 bam3 ...]"
     echo ""
     echo "  region: Genomic region, e.g., chr3L:8710861-8744900"
-    echo "  bam:    Path to input BAM file"
     echo "  outdir: Directory for intermediate and output files"
+    echo "  bam:    One or more BAM files to pool reads from"
     echo ""
     echo "Environment variables (optional):"
     echo "  REF:     Reference genome FASTA (default: dm6_conTE.fa)"
@@ -19,8 +19,9 @@ if [ $# -lt 3 ]; then
 fi
 
 REGION="$1"
-INPUTBAM="$2"
-OUTDIR="$3"
+OUTDIR="$2"
+shift 2
+BAMS=("$@")
 
 # Reference files (can be overridden via environment)
 REF="${REF:-/dfs7/adl/sruckman/XQTL/XQTL2/ref/dm6_conTE.fa}"
@@ -42,19 +43,20 @@ REGION_END="${REGION_COORDS#*-}"
 REGION_EXT="${REGION_CHR}:$((REGION_START - 1000))-$((REGION_END + 1000))"
 END_MARGIN=700
 
-echo "=== TE Junction Assembly Pipeline ==="
+echo "=== TE Junction Assembly Pipeline (Pooled Discovery) ==="
 echo "REGION: $REGION (extended: $REGION_EXT)"
-echo "INPUTBAM: $INPUTBAM"
+echo "BAMs (${#BAMS[@]}): ${BAMS[*]}"
 echo "OUTDIR: $OUTDIR"
 
 #=============================================================================
-# SECTION 1: Extract candidate reads
+# SECTION 1: Extract candidate reads from ALL BAMs
 #   - Gold: maps uniquely to region AND has alignment to FBte (canonical TE)
 #   - Junction: maps uniquely to region AND mate unmapped or maps elsewhere
 #   - Exclude: reads near region ends pointing outward (they span region boundary, not TE)
+#   - Pool candidates across all BAMs for maximum assembly coverage
 #=============================================================================
 echo ""
-echo "=== Section 1: Extract candidate reads ==="
+echo "=== Section 1: Extract candidate reads (pooled from ${#BAMS[@]} BAMs) ==="
 module load samtools/1.15.1
 
 # Filter: primary alignments, MAPQ>=20, exclude near-end pointing out
@@ -72,19 +74,32 @@ awk_filter='
     print $1
   }'
 
-# Get region-unique read names (MAPQ>=20, primary, not near-end-out)
-samtools view -q 20 "$INPUTBAM" "$REGION_EXT" | \
-  awk -v require_mate_unmapped=0 "$awk_filter" | sort -u > "$OUTDIR/region_unique.txt"
+# Initialize pooled files
+> "$OUTDIR/gold_all.txt"
+> "$OUTDIR/junction_all.txt"
 
-# Gold: region-unique AND has any alignment to FBte
-samtools view "$INPUTBAM" -N "$OUTDIR/region_unique.txt" | \
-  awk '$3 ~ /^FBte/ || $7 ~ /^FBte/ {print $1}' | sort -u > "$OUTDIR/gold.txt"
+for bam in "${BAMS[@]}"; do
+    bam_name=$(basename "$bam" .bam)
+    echo "  Processing BAM: $bam_name"
 
-# Junction: region-unique AND mate unmapped
-samtools view -q 20 "$INPUTBAM" "$REGION_EXT" | \
-  awk -v require_mate_unmapped=1 "$awk_filter" | sort -u > "$OUTDIR/junction.txt"
+    # Get region-unique read names (MAPQ>=20, primary, not near-end-out)
+    samtools view -q 20 "$bam" "$REGION_EXT" | \
+      awk -v require_mate_unmapped=0 "$awk_filter" | sort -u > "$OUTDIR/region_unique_${bam_name}.txt"
 
-# Union
+    # Gold: region-unique AND has any alignment to FBte
+    samtools view "$bam" -N "$OUTDIR/region_unique_${bam_name}.txt" | \
+      awk '$3 ~ /^FBte/ || $7 ~ /^FBte/ {print $1}' | sort -u >> "$OUTDIR/gold_all.txt"
+
+    # Junction: region-unique AND mate unmapped
+    samtools view -q 20 "$bam" "$REGION_EXT" | \
+      awk -v require_mate_unmapped=1 "$awk_filter" | sort -u >> "$OUTDIR/junction_all.txt"
+
+    echo "    region_unique: $(wc -l < "$OUTDIR/region_unique_${bam_name}.txt")"
+done
+
+# Deduplicate across all BAMs
+sort -u "$OUTDIR/gold_all.txt" > "$OUTDIR/gold.txt"
+sort -u "$OUTDIR/junction_all.txt" > "$OUTDIR/junction.txt"
 cat "$OUTDIR/gold.txt" "$OUTDIR/junction.txt" | sort -u > "$OUTDIR/candidates.txt"
 
 echo "Gold (region+FBte): $(wc -l < "$OUTDIR/gold.txt")"
@@ -92,16 +107,21 @@ echo "Junction (mate unmapped): $(wc -l < "$OUTDIR/junction.txt")"
 echo "Total candidates: $(wc -l < "$OUTDIR/candidates.txt")"
 
 #=============================================================================
-# SECTION 2: Build FASTA of candidate reads
+# SECTION 2: Build FASTA of candidate reads from ALL BAMs
 #=============================================================================
 echo ""
-echo "=== Section 2: Build reads FASTA ==="
+echo "=== Section 2: Build reads FASTA (pooled) ==="
 
-samtools view "$INPUTBAM" -N "$OUTDIR/candidates.txt" | \
-  awk 'int($2/256)%2==0 && int($2/2048)%2==0 {
-    print ">" $1 "/" (int($2/64)%2==1 ? "1" : "2")
-    print $10
-  }' > "$OUTDIR/reads.fasta"
+> "$OUTDIR/reads.fasta"
+for bam in "${BAMS[@]}"; do
+    bam_name=$(basename "$bam" .bam)
+    samtools view "$bam" -N "$OUTDIR/candidates.txt" | \
+      awk 'int($2/256)%2==0 && int($2/2048)%2==0 {
+        print ">" $1 "/" (int($2/64)%2==1 ? "1" : "2")
+        print $10
+      }' >> "$OUTDIR/reads.fasta"
+    echo "  $bam_name: done"
+done
 
 echo "Reads FASTA: $OUTDIR/reads.fasta ($(grep -c '^>' "$OUTDIR/reads.fasta") sequences)"
 
@@ -219,6 +239,6 @@ python scripts/build_te_alignment.py \
     "$OUTDIR"
 
 echo ""
-echo "=== Complete ==="
+echo "=== Phase 1 Complete ==="
 echo "Output files in: $OUTDIR"
 ls -la "$OUTDIR"/junction_*.fasta 2>/dev/null || echo "No junction files produced"
