@@ -154,11 +154,12 @@ module load SPAdes/3.15.4
 SPADES_OPTS="-k 21,33,55 --meta"
 
 rm -rf "$OUTDIR/assembly"
-echo "Running: spades.py -1 R1.fq -2 R2.fq -s singles.fq -o assembly $SPADES_OPTS"
+# echo "Running: spades.py -1 R1.fq -2 R2.fq -s singles.fq -o assembly $SPADES_OPTS"
+echo "Running: spades.py -1 R1.fq -2 R2.fq -o assembly $SPADES_OPTS"
 spades.py \
     -1 "$OUTDIR/R1.fq" \
     -2 "$OUTDIR/R2.fq" \
-    -s "$OUTDIR/singles.fq" \
+#    -s "$OUTDIR/singles.fq" \
     -o "$OUTDIR/assembly" \
     $SPADES_OPTS > "$OUTDIR/spades.log" 2>&1
 
