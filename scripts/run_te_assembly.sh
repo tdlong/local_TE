@@ -50,99 +50,117 @@ echo "OUTDIR: $OUTDIR"
 
 #=============================================================================
 # SECTION 1: Extract candidate reads from ALL BAMs
-#   - Gold: maps uniquely to region AND has alignment to FBte (canonical TE)
-#   - Junction: maps uniquely to region AND mate unmapped or maps elsewhere
-#   - Exclude: reads near region ends pointing outward (they span region boundary, not TE)
-#   - Pool candidates across all BAMs for maximum assembly coverage
+#   Criterion: maps to region (MAPQ>=20, primary) AND mate is NOT on the
+#   same chromosome ($7 != "="). This captures in one pass:
+#     - Gold: mate maps to FBte reference
+#     - Junction: mate unmapped
+#     - Discordant: mate maps to different chromosome (TE copy elsewhere)
+#   Exclude: reads near region ends pointing outward (boundary, not TE)
 #=============================================================================
 echo ""
 echo "=== Section 1: Extract candidate reads (pooled from ${#BAMS[@]} BAMs) ==="
 module load samtools/1.15.1
 
-# Filter: primary alignments, MAPQ>=20, exclude near-end pointing out
-awk_filter='
-  int($2/256)%2==0 && int($2/2048)%2==0 {
-    len = length($10)
-    pos_end = $4 + len - 1
-    reverse = int($2/16)%2
-    # Near left end pointing out (reverse strand, ends within margin of region start)
-    if (reverse && pos_end >= '$REGION_START' && pos_end <= '$REGION_START' + '$END_MARGIN') next
-    # Near right end pointing out (forward strand, starts within margin of region end)
-    if (!reverse && $4 >= '$REGION_END' - '$END_MARGIN' && $4 <= '$REGION_END') next
-    # If requiring mate unmapped, check FLAG bit 8
-    if (require_mate_unmapped && int($2/8)%2 != 1) next
-    print $1
-  }'
-
-# Initialize pooled files
-> "$OUTDIR/gold_all.txt"
-> "$OUTDIR/junction_all.txt"
+> "$OUTDIR/candidates_all.txt"
 
 for bam in "${BAMS[@]}"; do
     bam_name=$(basename "$bam" .bam)
     echo "  Processing BAM: $bam_name"
 
-    # Get region-unique read names (MAPQ>=20, primary, not near-end-out)
+    # Reads in region, MAPQ>=20, primary, not near-end pointing out,
+    # mate NOT on same chromosome
     samtools view -q 20 "$bam" "$REGION_EXT" | \
-      awk -v require_mate_unmapped=0 "$awk_filter" | sort -u > "$OUTDIR/region_unique_${bam_name}.txt"
+      awk '
+        int($2/256)%2==0 && int($2/2048)%2==0 {
+          len = length($10)
+          pos_end = $4 + len - 1
+          reverse = int($2/16)%2
+          if (reverse && pos_end >= '$REGION_START' && pos_end <= '$REGION_START' + '$END_MARGIN') next
+          if (!reverse && $4 >= '$REGION_END' - '$END_MARGIN' && $4 <= '$REGION_END') next
+          if ($7 != "=") print $1
+        }' | sort -u >> "$OUTDIR/candidates_all.txt"
 
-    # Gold: region-unique AND has any alignment to FBte
-    samtools view "$bam" -N "$OUTDIR/region_unique_${bam_name}.txt" | \
-      awk '$3 ~ /^FBte/ || $7 ~ /^FBte/ {print $1}' | sort -u >> "$OUTDIR/gold_all.txt"
-
-    # Junction: region-unique AND mate unmapped
-    samtools view -q 20 "$bam" "$REGION_EXT" | \
-      awk -v require_mate_unmapped=1 "$awk_filter" | sort -u >> "$OUTDIR/junction_all.txt"
-
-    echo "    region_unique: $(wc -l < "$OUTDIR/region_unique_${bam_name}.txt")"
+    echo "    done"
 done
 
-# Deduplicate across all BAMs
-sort -u "$OUTDIR/gold_all.txt" > "$OUTDIR/gold.txt"
-sort -u "$OUTDIR/junction_all.txt" > "$OUTDIR/junction.txt"
-cat "$OUTDIR/gold.txt" "$OUTDIR/junction.txt" | sort -u > "$OUTDIR/candidates.txt"
-
-echo "Gold (region+FBte): $(wc -l < "$OUTDIR/gold.txt")"
-echo "Junction (mate unmapped): $(wc -l < "$OUTDIR/junction.txt")"
+# Deduplicate across BAMs
+sort -u "$OUTDIR/candidates_all.txt" > "$OUTDIR/candidates.txt"
 echo "Total candidates: $(wc -l < "$OUTDIR/candidates.txt")"
 
 #=============================================================================
-# SECTION 2: Build FASTA of candidate reads from ALL BAMs
+# SECTION 2: Extract paired-end reads for assembly
+#   Extract all alignments for candidate read names, name-sort, then
+#   convert to proper paired-end FASTQ for SPAdes.
 #=============================================================================
 echo ""
-echo "=== Section 2: Build reads FASTA (pooled) ==="
+echo "=== Section 2: Extract paired-end reads (pooled) ==="
 
-> "$OUTDIR/reads.fasta"
+# Extract primary alignments for candidate reads from each BAM, merge into one name-sorted BAM
+> "$OUTDIR/cand_bam_list.txt"
 for bam in "${BAMS[@]}"; do
     bam_name=$(basename "$bam" .bam)
-    samtools view "$bam" -N "$OUTDIR/candidates.txt" | \
-      awk 'int($2/256)%2==0 && int($2/2048)%2==0 {
-        print ">" $1 "/" (int($2/64)%2==1 ? "1" : "2")
-        print $10
-      }' >> "$OUTDIR/reads.fasta"
-    echo "  $bam_name: done"
+    samtools view -b -F 0x900 "$bam" -N "$OUTDIR/candidates.txt" \
+        > "$OUTDIR/cand_${bam_name}.bam"
+    echo "$OUTDIR/cand_${bam_name}.bam" >> "$OUTDIR/cand_bam_list.txt"
+    echo "  $bam_name: extracted"
 done
 
-echo "Reads FASTA: $OUTDIR/reads.fasta ($(grep -c '^>' "$OUTDIR/reads.fasta") sequences)"
+# Merge (handles single or multiple BAMs) and name-sort
+if [ ${#BAMS[@]} -eq 1 ]; then
+    samtools sort -n -o "$OUTDIR/candidates_namesorted.bam" \
+        "$OUTDIR/cand_$(basename "${BAMS[0]}" .bam).bam"
+else
+    samtools merge -o "$OUTDIR/candidates_merged.bam" -b "$OUTDIR/cand_bam_list.txt"
+    samtools sort -n -o "$OUTDIR/candidates_namesorted.bam" "$OUTDIR/candidates_merged.bam"
+    rm -f "$OUTDIR/candidates_merged.bam"
+fi
+
+# Convert to paired-end FASTQ
+samtools fastq \
+    -1 "$OUTDIR/R1.fq" \
+    -2 "$OUTDIR/R2.fq" \
+    -s "$OUTDIR/singles.fq" \
+    -0 "$OUTDIR/other.fq" \
+    "$OUTDIR/candidates_namesorted.bam"
+
+# Count reads
+n_r1=$(grep -c '^@' "$OUTDIR/R1.fq" 2>/dev/null || echo 0)
+n_r2=$(grep -c '^@' "$OUTDIR/R2.fq" 2>/dev/null || echo 0)
+n_singles=$(grep -c '^@' "$OUTDIR/singles.fq" 2>/dev/null || echo 0)
+echo "Paired: $n_r1 R1 + $n_r2 R2, Singles: $n_singles"
+
+# Also build reads.fasta for BLAST reality check (Section 4)
+awk 'NR%4==1 {sub(/^@/, ">"); print} NR%4==2 {print}' \
+    "$OUTDIR/R1.fq" "$OUTDIR/R2.fq" "$OUTDIR/singles.fq" \
+    > "$OUTDIR/reads.fasta"
+echo "Reads FASTA: $(grep -c '^>' "$OUTDIR/reads.fasta") sequences"
 
 # Also get reference region
 samtools faidx "$REF" "$REGION" > "$OUTDIR/region.fasta"
 
+# Clean up temp BAMs
+rm -f "$OUTDIR"/cand_*.bam "$OUTDIR/cand_bam_list.txt" "$OUTDIR/candidates_namesorted.bam"
+
 #=============================================================================
-# SECTION 3: Assemble with SPAdes
+# SECTION 3: Assemble with SPAdes (metagenome mode)
+#   --meta: preserves low-coverage paths (TE junctions at low frequency)
+#   Paired-end reads give SPAdes mate evidence to recognize TE branches
+#   as alternate haplotypes rather than noise
 #=============================================================================
 echo ""
-echo "=== Section 3: SPAdes assembly ==="
+echo "=== Section 3: SPAdes assembly (--meta, paired-end) ==="
 module load SPAdes/3.15.4
 
-# SPAdes options for low-depth TE junction assembly
-# -k 21,33,55: smaller k-mers (skip 77 which often has no coverage)
-# --only-assembler: skip error correction (can drop low-coverage TE reads)
-SPADES_OPTS="-k 21,33,55 --only-assembler"
+SPADES_OPTS="-k 21,33,55 --meta"
 
 rm -rf "$OUTDIR/assembly"
-echo "Running: spades.py -s $OUTDIR/reads.fasta -o $OUTDIR/assembly $SPADES_OPTS"
-spades.py -s "$OUTDIR/reads.fasta" -o "$OUTDIR/assembly" $SPADES_OPTS > "$OUTDIR/spades.log" 2>&1
+echo "Running: spades.py -1 R1.fq -2 R2.fq -s singles.fq -o assembly $SPADES_OPTS"
+spades.py \
+    -1 "$OUTDIR/R1.fq" \
+    -2 "$OUTDIR/R2.fq" \
+    -s "$OUTDIR/singles.fq" \
+    -o "$OUTDIR/assembly" \
+    $SPADES_OPTS > "$OUTDIR/spades.log" 2>&1
 
 if [ ! -s "$OUTDIR/assembly/contigs.fasta" ]; then
   echo "ERROR: No contigs produced. Check $OUTDIR/spades.log" >&2
@@ -221,6 +239,10 @@ minimap2 -c "$OUTDIR/region.fasta" "$OUTDIR/te_contigs.fasta" > "$OUTDIR/junctio
 
 # Map junction contigs to TE database
 minimap2 -c "$OUTDIR/te_seqs.fasta" "$OUTDIR/te_contigs.fasta" > "$OUTDIR/junctions_to_te.paf" 2>/dev/null
+
+# Diagnostic: show alignment counts
+echo "  Ref PAF entries: $(wc -l < "$OUTDIR/junctions_to_ref.paf")"
+echo "  TE PAF entries:  $(wc -l < "$OUTDIR/junctions_to_te.paf")"
 
 echo "Generated: $OUTDIR/junctions_to_ref.paf, $OUTDIR/junctions_to_te.paf"
 

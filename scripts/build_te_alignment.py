@@ -290,27 +290,60 @@ def main():
     te_seqs = {rec.id: str(rec.seq) for rec in SeqIO.parse(te_file, "fasta")}
     junc_seqs = {rec.id: str(rec.seq) for rec in SeqIO.parse(junc_file, "fasta")}
     
-    ref_alns = {a['query']: a for a in parse_paf(junc_to_ref_paf)}
-    te_alns = {a['query']: a for a in parse_paf(junc_to_te_paf)}
+    # Keep the best (longest aligned span) alignment per query
+    def best_per_query(alignments):
+        best = {}
+        for a in alignments:
+            q = a['query']
+            span = a['qend'] - a['qstart']
+            if q not in best or span > (best[q]['qend'] - best[q]['qstart']):
+                best[q] = a
+        return best
     
+    ref_alns = best_per_query(parse_paf(junc_to_ref_paf))
+    te_alns = best_per_query(parse_paf(junc_to_te_paf))
+    
+    print(f"\nJunction contigs: {len(junc_seqs)}")
+    print(f"  with ref alignment: {len(ref_alns)}")
+    print(f"  with TE alignment:  {len(te_alns)}")
+    
+    n_processed = 0
     for jname in junc_seqs:
-        if jname in ref_alns and jname in te_alns:
-            result = build_junction_view(
-                jname, junc_seqs[jname],
-                ref_alns[jname], te_alns[jname],
-                ref_seq, te_seqs,
-                region_chrom, region_start
-            )
-            if result:
-                outfile = os.path.join(outdir, f"junction_{result['type']}_{jname[:20]}.fasta")
-                with open(outfile, 'w') as f:
-                    f.write(f">{result['wt_ref_label']}\n{result['wt_ref_seq']}\n")
-                    f.write(f">{result['ref_label']}\n{result['ref_seq']}\n")
-                    f.write(f">{result['junc_label']}\n{result['junc_seq']}\n")
-                    f.write(f">{result['te_label']}\n{result['te_seq']}\n")
-                print(f"  Written: {outfile}")
+        if jname not in ref_alns:
+            print(f"\n  SKIPPED: {jname} -- no alignment to reference")
+            print(f"    (contig length: {len(junc_seqs[jname])}bp, "
+                  f"likely too little reference flank -- assembly issue)")
+            if jname in te_alns:
+                te_span = te_alns[jname]['qend'] - te_alns[jname]['qstart']
+                ref_flank = len(junc_seqs[jname]) - te_span
+                print(f"    (TE alignment to {te_alns[jname]['target']}: "
+                      f"{te_span}bp TE + ~{ref_flank}bp flank)")
+            continue
+        if jname not in te_alns:
+            print(f"\n  SKIPPED: {jname} -- no alignment to TE")
+            print(f"    (contig length: {len(junc_seqs[jname])}bp)")
+            if jname in ref_alns:
+                print(f"    (has ref alignment: "
+                      f"qpos {ref_alns[jname]['qstart']}-{ref_alns[jname]['qend']})")
+            continue
+        
+        result = build_junction_view(
+            jname, junc_seqs[jname],
+            ref_alns[jname], te_alns[jname],
+            ref_seq, te_seqs,
+            region_chrom, region_start
+        )
+        if result:
+            outfile = os.path.join(outdir, f"junction_{result['type']}_{jname[:20]}.fasta")
+            with open(outfile, 'w') as f:
+                f.write(f">{result['wt_ref_label']}\n{result['wt_ref_seq']}\n")
+                f.write(f">{result['ref_label']}\n{result['ref_seq']}\n")
+                f.write(f">{result['junc_label']}\n{result['junc_seq']}\n")
+                f.write(f">{result['te_label']}\n{result['te_seq']}\n")
+            print(f"  Written: {outfile}")
+            n_processed += 1
     
-    print("\nDone!")
+    print(f"\nDone! {n_processed} junctions visualized out of {len(junc_seqs)} contigs.")
 
 
 if __name__ == "__main__":
