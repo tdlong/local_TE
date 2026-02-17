@@ -124,10 +124,12 @@ def main():
     output_path = args.output or os.path.join(
         args.results_dir, 'genotype_results.tsv')
 
+    all_samples = sorted(data)
+
     with open(output_path, 'w') as out:
         out.write("sample\tjunction\tgenotype\tabs_reads\tpre_reads\ttotal\tnotes\n")
 
-        for sample in sorted(data):
+        for sample in all_samples:
             for junction in all_junctions:
                 abs_c = data[sample][junction]['abs']
                 pre_c = data[sample][junction]['pre']
@@ -138,12 +140,29 @@ def main():
                     f"{sample}\t{junction}\t{genotype}\t"
                     f"{abs_c}\t{pre_c}\t{total}\t{notes}\n")
 
-    n_samples = len(data)
+    # Frequency matrix: rows=junctions, columns=samples, values=pre/(abs+pre)
+    freq_path = os.path.splitext(output_path)[0] + '_freq_matrix.tsv'
+    with open(freq_path, 'w') as out:
+        out.write("junction\t" + "\t".join(all_samples) + "\n")
+        for junction in all_junctions:
+            row = [junction]
+            for sample in all_samples:
+                abs_c = data[sample][junction]['abs']
+                pre_c = data[sample][junction]['pre']
+                total = abs_c + pre_c
+                if total < args.min_depth:
+                    row.append("NA")
+                else:
+                    row.append(f"{pre_c / total:.4f}")
+            out.write("\t".join(row) + "\n")
+
+    n_samples = len(all_samples)
     n_junctions = len(all_junctions)
     print(f"Wrote {n_samples} samples × {n_junctions} junctions to {output_path}")
+    print(f"Frequency matrix: {freq_path}")
     print()
 
-    with open(output_path) as f:
+    with open(freq_path) as f:
         for line in f:
             print(line, end='')
 
