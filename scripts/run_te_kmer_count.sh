@@ -40,21 +40,25 @@ for f in "$R1" "$R2" "$ABS_KMERS" "$PRE_KMERS"; do
     fi
 done
 
+# BBDuk is Java-based; load Java before activating conda
+module load java/17
+
 # Activate conda/BBMap
 source ~/miniforge3/etc/profile.d/conda.sh
 source ~/miniforge3/etc/profile.d/mamba.sh
 mamba activate bbmap
 
 # Count absence allele k-mers
+# -Xmx5g: explicit heap limit so BBDuk doesn't auto-detect node RAM
 echo "  Counting absence k-mers..."
-bbduk.sh in="$R1" in2="$R2" \
+bbduk.sh -Xmx5g in="$R1" in2="$R2" \
     ref="$ABS_KMERS" \
     k=31 maskmiddle=f rcomp=t \
     stats="$OUTDIR/${SAMPLE}_abs_stats.txt"
 
 # Count presence allele k-mers
 echo "  Counting presence k-mers..."
-bbduk.sh in="$R1" in2="$R2" \
+bbduk.sh -Xmx5g in="$R1" in2="$R2" \
     ref="$PRE_KMERS" \
     k=31 maskmiddle=f rcomp=t \
     stats="$OUTDIR/${SAMPLE}_pre_stats.txt"
