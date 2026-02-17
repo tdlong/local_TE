@@ -3,8 +3,11 @@
 genotype_from_counts.py
 
 Genotype TE junctions from BBDuk k-mer counting results.
-Parses BBDuk stats files to extract matched read counts, then calls
-genotypes based on the ratio of absence vs presence allele reads.
+Parses per-k-mer detail lines from BBDuk stats files, groups by junction ID,
+and calls genotypes based on the ratio of absence vs presence allele reads.
+
+K-mers must be named {junction_id}__kmer_NNN (as written by extract_junction_kmers.py).
+Reports one genotype row per sample per junction.
 
 Usage:
     python genotype_from_counts.py <results_dir> [-o genotype_results.tsv]
@@ -18,13 +21,42 @@ from collections import defaultdict
 
 
 def parse_bbduk_stats(stats_file):
-    """Parse BBDuk stats file to get #Matched read count."""
+    """
+    Parse BBDuk stats file. Returns dict of {junction_id: read_count}.
+
+    Reads the per-k-mer detail lines (below #Name header), extracts
+    junction_id from the k-mer name (splits on '__kmer_'), and takes
+    the MAX read count across k-mers for each junction. Using MAX rather
+    than SUM avoids double-counting reads that match multiple k-mers
+    spanning the same junction.
+    """
+    junction_counts = defaultdict(int)
+    in_detail = False
+
     with open(stats_file) as f:
         for line in f:
-            if line.startswith('#Matched'):
-                parts = line.strip().split('\t')
-                return int(parts[1])
-    return 0
+            line = line.strip()
+            if line.startswith('#Name'):
+                in_detail = True
+                continue
+            if not in_detail or not line or line.startswith('#'):
+                continue
+            parts = line.split('\t')
+            if len(parts) < 2:
+                continue
+            kmer_name = parts[0]
+            try:
+                reads = int(parts[1])
+            except ValueError:
+                continue
+            # Extract junction_id from name like: chr3L_8711446_FBte0000626__kmer_000
+            if '__kmer_' in kmer_name:
+                junction_id = kmer_name.rsplit('__kmer_', 1)[0]
+            else:
+                junction_id = kmer_name
+            junction_counts[junction_id] = max(junction_counts[junction_id], reads)
+
+    return dict(junction_counts)
 
 
 def call_genotype(abs_count, pre_count, min_depth=5, het_min=0.2, het_max=0.8):
@@ -73,36 +105,44 @@ def main():
         print(f"No stats files found in {args.results_dir}", file=sys.stderr)
         sys.exit(1)
 
-    # Collect counts by sample
-    data = defaultdict(lambda: {'abs': 0, 'pre': 0})
+    # data[sample][junction_id] = {'abs': count, 'pre': count}
+    data = defaultdict(lambda: defaultdict(lambda: {'abs': 0, 'pre': 0}))
 
     for f in abs_files:
         sample = os.path.basename(f).replace('_abs_stats.txt', '')
-        data[sample]['abs'] = parse_bbduk_stats(f)
+        for junction_id, count in parse_bbduk_stats(f).items():
+            data[sample][junction_id]['abs'] = count
 
     for f in pre_files:
         sample = os.path.basename(f).replace('_pre_stats.txt', '')
-        data[sample]['pre'] = parse_bbduk_stats(f)
+        for junction_id, count in parse_bbduk_stats(f).items():
+            data[sample][junction_id]['pre'] = count
 
-    # Output
+    # Collect all junction IDs seen across all samples
+    all_junctions = sorted({j for s in data.values() for j in s})
+
     output_path = args.output or os.path.join(
         args.results_dir, 'genotype_results.tsv')
 
     with open(output_path, 'w') as out:
-        out.write("sample\tgenotype\tabs_reads\tpre_reads\ttotal\tnotes\n")
+        out.write("sample\tjunction\tgenotype\tabs_reads\tpre_reads\ttotal\tnotes\n")
 
         for sample in sorted(data):
-            abs_c = data[sample]['abs']
-            pre_c = data[sample]['pre']
-            total = abs_c + pre_c
-            genotype, notes = call_genotype(
-                abs_c, pre_c, args.min_depth, args.het_min, args.het_max)
-            out.write(f"{sample}\t{genotype}\t{abs_c}\t{pre_c}\t{total}\t{notes}\n")
+            for junction in all_junctions:
+                abs_c = data[sample][junction]['abs']
+                pre_c = data[sample][junction]['pre']
+                total = abs_c + pre_c
+                genotype, notes = call_genotype(
+                    abs_c, pre_c, args.min_depth, args.het_min, args.het_max)
+                out.write(
+                    f"{sample}\t{junction}\t{genotype}\t"
+                    f"{abs_c}\t{pre_c}\t{total}\t{notes}\n")
 
-    print(f"Wrote genotypes for {len(data)} samples to {output_path}")
+    n_samples = len(data)
+    n_junctions = len(all_junctions)
+    print(f"Wrote {n_samples} samples × {n_junctions} junctions to {output_path}")
     print()
 
-    # Print results
     with open(output_path) as f:
         for line in f:
             print(line, end='')

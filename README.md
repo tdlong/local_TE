@@ -48,11 +48,14 @@ cd /dfs7/adl/tdlong/Sarah/local_TE
 
 # 1. Edit config.sh with your BAMs, regions, and FASTQ paths
 
-# 2. Phase 1: Discover TE insertions
+# 2. Phase 1: Discover TE insertions (pool BAMs, assemble, BLAST, visualize)
 sbatch scripts/submit_te_analysis.sh
+# → temp_work/<region>/junction_*.fasta   (one file per TE found, per region)
+# → junctions.fa                          (Abs/Pre sequence pairs for all TEs)
 
-# 3. Phase 2: Genotype via k-mer counting
+# 3. Phase 2: Genotype each TE across all samples via k-mer counting
 sbatch scripts/submit_te_kmer_count.sh
+# → kmer_work/genotype_results.tsv        (one row per sample × TE junction)
 ```
 
 ## Phase 1: Discovery
