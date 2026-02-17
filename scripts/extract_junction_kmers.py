@@ -18,19 +18,28 @@ import os
 from Bio import SeqIO
 
 
-def extract_junction_spanning_kmers(abs_seq, pre_seq, junction_pos, k=31):
+def extract_junction_spanning_kmers(abs_seq, pre_seq, junction_pos, k=31, min_flank=10):
     """
-    Extract k-mers that span the junction point.
+    Extract k-mers that span the junction with at least min_flank bases on each side.
     Only returns allele-specific k-mers (set difference).
 
     junction_pos: 0-based position where junction occurs.
-    A k-mer "spans" the junction if it includes bases from both sides.
+    min_flank: minimum bases required from each side of the junction.
+               This prevents k-mers that are almost entirely TE sequence from
+               matching reads at other TE copies elsewhere in the genome.
+
+    With junction_pos=50, k=31, min_flank=10:
+      start ranges from 29 to 40  (12 k-mers, each with >=10bp on both sides)
     """
     abs_junction_kmers = set()
     pre_junction_kmers = set()
 
-    for start in range(max(0, junction_pos - k + 1),
-                       min(junction_pos + 1, len(abs_seq) - k + 1)):
+    # start + min_flank <= junction_pos  → start <= junction_pos - min_flank
+    # start + k - min_flank >= junction_pos → start >= junction_pos - k + min_flank
+    start_min = max(0, junction_pos - k + min_flank)
+    start_max = min(junction_pos - min_flank, len(abs_seq) - k, len(pre_seq) - k)
+
+    for start in range(start_min, start_max + 1):
         abs_kmer = abs_seq[start:start + k]
         pre_kmer = pre_seq[start:start + k]
         if len(abs_kmer) == k:
