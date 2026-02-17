@@ -48,3 +48,244 @@ INSERTION of FBte0000626 at chr3L:8711446
     TE:     GTCATCATTTCGAATTTCTGCCAAAAAAAAACACATAAAAAACCACTGTG--------------------------------------------------
   Written: junction_right_NODE_21_length_563_c.fasta
 
+Now the chr3L identification and assembly of TEs is correct.  But the X chromsome one is failing
+[tdlong@login-i15:/dfs7/adl/tdlong/Sarah/local_TE]$ cat temp_work/chrX_8450000-8500000/junctions_to_ref.paf 
+NODE_35_length_328_cov_0.937729	328	0	328	-	chrX:8450000-8500000	50001	10084	10412	325	328	60	NM:i:3	ms:i:638	AS:i:638	nn:i:0	tp:A:P	cm:i:53	s1:i:293	s2:i:0	de:f:0.0091	rl:i:0	cg:Z:328M
+[tdlong@login-i15:/dfs7/adl/tdlong/Sarah/local_TE]$ cat temp_work/chrX_8450000-8500000/junctions_to_te.paf 
+NODE_4_length_528_cov_11.422833	528	2	225	+	FBte0000619	5484	4121	4344	216	223	60	NM:i:7	ms:i:404	AS:i:404	nn:i:0	tp:A:P	cm:i:44	s1:i:201	s2:i:82	de:f:0.0314	rl:i:0	cg:Z:223M
+NODE_35_length_328_cov_0.937729	328	2	305	+	FBte0000414	1653	36	338	273	309	60	NM:i:36	ms:i:402	AS:i:396	nn:i:0	tp:A:P	cm:i:17	s1:i:126	s2:i:0	de:f:0.1020	rl:i:0	cg:Z:20M1I12M5D78M1D6M1I8M1I121M2I3M1I5M1I43M
+NODE_67_length_259_cov_1.882353	259	0	259	+	FBte0000726	7062	1478	1737	253	259	60	NM:i:6	ms:i:482	AS:i:482	nn:i:0	tp:A:P	cm:i:30	s1:i:201	s2:i:0	de:f:0.0232	rl:i:0	cg:Z:259M
+
+Reference Genome Alignments (junctions_to_ref.paf):
+
+NODE_35_length_328_cov_0.937729:
+
+Contig bases 0-328 (entire contig, reverse strand) align to reference chrX:8450000-8500000
+Aligned to reference positions 10084-10412
+Very high quality: 325/328 matching bases (99.1% identity)
+TE Alignments (junctions_to_te.paf):
+
+NODE_4_length_528_cov_11.422833:
+
+Contig bases 2-225 align to TE FBte0000619
+216/223 matching bases (96.9% identity)
+Bases 0-2 and 225-528 do NOT align to TE
+NODE_35_length_328_cov_0.937729: ⚠️ Same contig that aligned to reference!
+
+Contig bases 2-305 align to TE FBte0000414
+Lower quality: 273/309 matching bases (89.8% identity)
+Multiple indels in alignment
+Bases 0-2 and 305-328 do NOT align to TE
+NODE_67_length_259_cov_1.882353:
+
+Contig bases 0-259 (entire contig) align to TE FBte0000726
+High quality: 253/259 matching bases (97.7% identity)
+
+The alignment stuff is a bit of a mess
+1.  why call a bash script from within the slurm script
+2.  why not have a script the build the index first, then a second array job for the six pairs of fastqs
+3.  usually bwa, goes straight to sorted bam, and is then indexed otherwise searches suck
+4.  I wonder in this case since we are aligning 100s of millions of reads to a tiny target, 
+        if we should only keep high scoring reads?  So the bam is tiny
+5.  The target is tiny relative to the matepairs, so we may wish to align individual reads or
+        at least think carefully about how we are aligning read pairs.
+
+Something like this may be better
+
+#!/usr/bin/env python3
+
+def extract_junction_spanning_kmers(abs_seq, pre_seq, junction_pos, k=31):
+    """
+    Extract k-mers that span the junction point.
+    junction_pos: 0-based position where junction occurs
+    """
+    # For a k-mer to span the junction, it must include bases from both sides
+    # Start positions: from (junction_pos - k + 1) to junction_pos
+    # This ensures k-mer overlaps the junction
+    
+    abs_junction_kmers = set()
+    pre_junction_kmers = set()
+    
+    # K-mers that span the junction (include bases from both sides)
+    for start in range(max(0, junction_pos - k + 1), min(junction_pos + 1, len(abs_seq) - k + 1)):
+        # This k-mer spans the junction
+        abs_kmer = abs_seq[start:start + k]
+        pre_kmer = pre_seq[start:start + k]
+        
+        if len(abs_kmer) == k:
+            abs_junction_kmers.add(abs_kmer)
+        if len(pre_kmer) == k:
+            pre_junction_kmers.add(pre_kmer)
+    
+    # Only keep k-mers unique to each allele at the junction
+    abs_specific = abs_junction_kmers - pre_junction_kmers
+    pre_specific = pre_junction_kmers - abs_junction_kmers
+    
+    return abs_specific, pre_specific
+
+# Example usage:
+abs_seq = "AGTGCCGAAAGTACAAGTTAAGTACATACATCGTGCCACTATTAACGCTCCACTGACAGCGGCAAAACACGCATCAAAAACACACATACAAATCGGCAGA"
+pre_seq = "GGTCATCATTTCGAATTTCTGCCAAAAAAAACGCATAAAAAACCACTGTGCACTGACAGCGGCAAAACACGCATCAAAAACACACATACAAATCGGCAGA"
+junction_pos = 50  # 0-based, left of "CACTGACAGC"
+
+abs_kmers, pre_kmers = extract_junction_spanning_kmers(abs_seq, pre_seq, junction_pos, k=31)
+
+print(f"Abs-specific junction k-mers: {len(abs_kmers)}")
+print(f"Pre-specific junction k-mers: {len(pre_kmers)}")
+for kmer in sorted(abs_kmers):
+    print(f"Abs: {kmer}")
+for kmer in sorted(pre_kmers):
+    print(f"Pre: {kmer}")
+
+#!/bin/bash
+
+# 1. Build diagnostic k-mer database
+python extract_junction_kmers.py junctions.fasta > diagnostic_kmers.txt
+
+# 2. Search reads for these k-mers with BBDuk
+for sample in *.fastq.gz; do
+    bbduk.sh in=$sample \
+        ref=abs_kmers.fasta \
+        outm=${sample%.fq.gz}_abs_supporting.fq \
+        k=31 maskmiddle=f rcomp=t \
+        stats=${sample%.fq.gz}_abs_stats.txt
+    
+    bbduk.sh in=$sample \
+        ref=pre_kmers.fasta \
+        outm=${sample%.fq.gz}_pre_supporting.fq \
+        k=31 maskmiddle=f rcomp=t \
+        stats=${sample%.fq.gz}_pre_stats.txt
+done
+
+# 3. Genotype based on counts
+python genotype_from_counts.py *_stats.txt > genotypes.tsv
+
+#!/usr/bin/env python3
+"""
+Genotype TE junctions from k-mer counting results.
+Takes BBDuk stats output and calls genotypes.
+"""
+
+
+# genotype_from_counts.py
+import sys
+import re
+from collections import defaultdict
+import argparse
+
+def parse_bbduk_stats(stats_file):
+    """Parse BBDuk stats file to get read count"""
+    # BBDuk stats format: 
+    # #File	<filename>
+    # #Total	<count>
+    # #Matched	<count>	<percent>
+    # #Name Reads ReadsPct
+    
+    with open(stats_file) as f:
+        for line in f:
+            if line.startswith('#Matched'):
+                parts = line.strip().split('\t')
+                matched_reads = int(parts[1])
+                return matched_reads
+    return 0
+
+def call_genotype(abs_count, pre_count, min_depth=5, het_ratio_min=0.2, het_ratio_max=0.8):
+    """
+    Call genotype based on allele counts.
+    
+    Parameters:
+    - min_depth: Minimum total reads to make a call
+    - het_ratio_min/max: Ratio range for heterozygote call
+    """
+    total = abs_count + pre_count
+    
+    if total < min_depth:
+        return "NO_CALL", abs_count, pre_count, total, "Insufficient_depth"
+    
+    abs_ratio = abs_count / total if total > 0 else 0
+    
+    # Homozygous Absent (Abs/Abs)
+    if abs_ratio >= het_ratio_max:
+        return "Abs/Abs", abs_count, pre_count, total, f"abs_ratio={abs_ratio:.3f}"
+    
+    # Homozygous Present (Pre/Pre)
+    elif abs_ratio <= het_ratio_min:
+        return "Pre/Pre", abs_count, pre_count, total, f"abs_ratio={abs_ratio:.3f}"
+    
+    # Heterozygous (Abs/Pre)
+    else:
+        return "Abs/Pre", abs_count, pre_count, total, f"abs_ratio={abs_ratio:.3f}"
+
+def main():
+    parser = argparse.ArgumentParser(description='Genotype TE junctions from k-mer counts')
+    parser.add_argument('stats_files', nargs='+', help='BBDuk stats files (*_abs_stats.txt and *_pre_stats.txt)')
+    parser.add_argument('--min-depth', type=int, default=5, help='Minimum total read depth for calling (default: 5)')
+    parser.add_argument('--het-min', type=float, default=0.2, help='Min allele ratio for heterozygote (default: 0.2)')
+    parser.add_argument('--het-max', type=float, default=0.8, help='Max allele ratio for heterozygote (default: 0.8)')
+    
+    args = parser.parse_args()
+    
+    # Parse stats files and organize by sample and junction
+    data = defaultdict(lambda: defaultdict(dict))
+    
+    for stats_file in args.stats_files:
+        # Expected format: sample_junction_allele_stats.txt
+        # e.g., sample1_chr3L_8711446_FBte0000626_abs_stats.txt
+        basename = stats_file.replace('_stats.txt', '')
+        
+        # Extract sample, junction, and allele
+        if '_abs' in basename:
+            allele = 'abs'
+            sample_junction = basename.replace('_abs', '')
+        elif '_pre' in basename:
+            allele = 'pre'
+            sample_junction = basename.replace('_pre', '')
+        else:
+            print(f"Warning: Cannot parse {stats_file}", file=sys.stderr)
+            continue
+        
+        # Further parse to get sample and junction
+        # Assuming format: sample_chr_pos_te
+        parts = sample_junction.split('_')
+        if len(parts) >= 4:
+            sample = parts[0]
+            junction = '_'.join(parts[1:])  # chr_pos_TE
+        else:
+            sample = sample_junction
+            junction = "unknown"
+        
+        count = parse_bbduk_stats(stats_file)
+        data[sample][junction][allele] = count
+    
+    # Output header
+    print("Sample\tJunction\tGenotype\tAbs_reads\tPre_reads\tTotal_reads\tNotes")
+    
+    # Call genotypes
+    for sample in sorted(data.keys()):
+        for junction in sorted(data[sample].keys()):
+            abs_count = data[sample][junction].get('abs', 0)
+            pre_count = data[sample][junction].get('pre', 0)
+            
+            genotype, abs_c, pre_c, total, notes = call_genotype(
+                abs_count, pre_count, 
+                min_depth=args.min_depth,
+                het_ratio_min=args.het_min,
+                het_ratio_max=args.het_max
+            )
+            
+            print(f"{sample}\t{junction}\t{genotype}\t{abs_c}\t{pre_c}\t{total}\t{notes}")
+
+if __name__ == '__main__':
+    main()
+
+
+
+BBDuk = "Decontamination Using Kmers"
+
+Part of BBTools/BBMap package (developed at JGI)
+Does fast k-mer matching against reference sequences
+Can filter, match, trim, and count reads based on k-mers
+Very fast and memory-efficient
+
+conda install -c bioconda bbmap
+
