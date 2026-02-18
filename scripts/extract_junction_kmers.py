@@ -63,10 +63,12 @@ def extract_junction_spanning_kmers(abs_seq, pre_seq, junction_pos, k=31, min_fl
     for start in range(start_min, start_max + 1):
         abs_kmer = abs_seq[start:start + k]
         pre_kmer = pre_seq[start:start + k]
-        if len(abs_kmer) == k:
+        if len(abs_kmer) == k and 'N' not in abs_kmer.upper():
             abs_junction_kmers.add(abs_kmer)
-        if len(pre_kmer) == k:
-            # Expand IUPAC ambiguity codes (SNPs encoded in Pre consensus)
+        if len(pre_kmer) == k and 'N' not in pre_kmer.upper():
+            # Expand IUPAC ambiguity codes (SNPs encoded in Pre consensus).
+            # N means no read coverage at that position — skip rather than
+            # expanding to {A,C,G,T} which would generate spurious k-mers.
             for variant in expand_iupac(pre_kmer):
                 pre_junction_kmers.add(variant)
 

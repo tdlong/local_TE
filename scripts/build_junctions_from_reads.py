@@ -293,6 +293,21 @@ def main():
     # For minus-strand ref hits the read is in reverse orientation, so the
     # layout is flipped:
     #   ref alignment precedes TE in original read → RIGHT (genomically)
+    #
+    # Insertion position: use ref alignment ENDPOINTS, not te_qstart.
+    # BLAST places te_qstart ±5-10bp variably; ref alignment endpoints are
+    # precisely determined by sequence similarity and stable across reads.
+    #
+    #   LEFT junction  → insertion = TE-adjacent END of ref alignment
+    #                  = max(sstart, send)  [high coord for both strands]
+    #   RIGHT junction → insertion = TE-adjacent START of ref alignment
+    #                  = min(sstart, send)  [low coord for both strands]
+    #
+    # Derivation:
+    #   plus-strand LEFT:  ref ends at send (high coord) → ins = send ✓
+    #   plus-strand RIGHT: ref starts at sstart (low coord) → ins = sstart ✓
+    #   minus-strand LEFT: ref is adjacent to TE at sstart (high coord) → ins = sstart ✓
+    #   minus-strand RIGHT: ref ends (at TE boundary) at send (low coord) → ins = send ✓
     # ------------------------------------------------------------------
     print("Step 3: Identifying junction reads")
     junction_reads = []
@@ -304,14 +319,18 @@ def main():
         te_qstart  = te_h['qstart']
         ref_qstart = ref_h['qstart']
 
-        # Infer insertion position in region.fasta coords (1-based)
+        # Junction type: determined by relative read positions of TE and ref
         if ref_h['sstrand'] == 'plus':
-            ins_region = ref_h['sstart'] + (te_qstart - ref_qstart)
             jtype = 'left' if ref_qstart < te_qstart else 'right'
         else:
-            ins_region = ref_h['sstart'] - (te_qstart - ref_qstart)
-            # Minus-strand: layout is flipped — opposite of plus-strand rule
+            # Minus-strand: layout is flipped vs plus-strand
             jtype = 'right' if ref_qstart < te_qstart else 'left'
+
+        # Insertion position from ref alignment endpoints (stable, no te_qstart)
+        if jtype == 'left':
+            ins_region = max(ref_h['sstart'], ref_h['send'])
+        else:
+            ins_region = min(ref_h['sstart'], ref_h['send'])
 
         junction_reads.append({
             'read_id':    read_id,
