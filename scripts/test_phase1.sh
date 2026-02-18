@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # test_phase1.sh -- Interactive end-to-end Phase 1 test using config.sh values.
 #
-# Sources config.sh, picks the first region and all configured BAMs, runs
-# run_te_assembly.sh with output to stdout (not a log file) so you can watch
-# progress in real time.
+# Sources config.sh, picks the first region and all configured BAMs, and runs
+# run_te_assembly.sh. Prints a clean diagnostic summary on completion.
 #
 # Run from the project root on a compute node:
 #   srun --pty bash
@@ -16,74 +15,79 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-
 cd "$PROJECT_ROOT"
 
-# Load config
 source config.sh
 
-# Pick first region
 TEST_REGION="${REGIONS[0]}"
-if [ -z "$TEST_REGION" ]; then
-    echo "ERROR: No REGIONS defined in config.sh" >&2
-    exit 1
-fi
+[ -n "$TEST_REGION" ] || { echo "ERROR: No REGIONS in config.sh" >&2; exit 1; }
 
-# Build full BAM paths
 BAM_PATHS=()
-for bam in "${BAMS[@]}"; do
-    BAM_PATHS+=("$BAM_DIR/$bam")
-done
+for bam in "${BAMS[@]}"; do BAM_PATHS+=("$BAM_DIR/$bam"); done
+[ ${#BAM_PATHS[@]} -gt 0 ] || { echo "ERROR: No BAMS in config.sh" >&2; exit 1; }
 
-if [ ${#BAM_PATHS[@]} -eq 0 ]; then
-    echo "ERROR: No BAMS defined in config.sh" >&2
-    exit 1
-fi
-
-# Output directory
 region_safe="${TEST_REGION//:/_}"
 TEST_OUTDIR="${TEST_OUTDIR:-temp_work/test_${region_safe}}"
 
 echo "=== Phase 1 Interactive Test ==="
 echo "Region:  $TEST_REGION"
-echo "BAMs:    ${BAM_PATHS[*]}"
+echo "BAMs:    ${#BAM_PATHS[@]} files"
 echo "Outdir:  $TEST_OUTDIR"
-echo "REF:     $REF"
-echo "TEFASTA: $TEFASTA"
 if [ -s "$TEST_OUTDIR/R1.fq" ]; then
-    echo ""
-    echo "NOTE: $TEST_OUTDIR/R1.fq exists — BAM extraction will be skipped."
-    echo "      Delete it to force re-extraction."
+    echo "Reads:   cached (delete R1.fq to re-extract)"
 fi
 echo ""
 
-# pipeline.log is written inside OUTDIR; print it at the end.
-
 REF="$REF" TEFASTA="$TEFASTA" \
     bash scripts/run_te_assembly.sh \
-        "$TEST_REGION" \
-        "$TEST_OUTDIR" \
-        "${BAM_PATHS[@]}" || true
+        "$TEST_REGION" "$TEST_OUTDIR" "${BAM_PATHS[@]}" || true
+
+LOG="$TEST_OUTDIR/pipeline.log"
+
+# ------------------------------------------------------------------
+# Summary: key metrics extracted from the pipeline log
+# ------------------------------------------------------------------
+echo ""
+echo "=== Summary ==="
+
+# Read/BLAST/cluster counts
+grep -E "^  (R1\.fq|Paired:|Total candidates:|Found [0-9]+ junction|raw clusters)" \
+    "$LOG" 2>/dev/null || true
+grep -E "^Step [12]:" "$LOG" 2>/dev/null || true
+grep -E "raw clusters" "$LOG" 2>/dev/null || true
 
 echo ""
-echo "=== Pipeline log ==="
-cat "$TEST_OUTDIR/pipeline.log" 2>/dev/null || echo "(no log file)"
+echo "Junction results (OK=written  SKIP=too many SNPs):"
+echo ""
+printf "  %-6s  %-32s  %-20s  %-14s  %4s  %5s  %8s\n" \
+    STATUS FILE INS_POS TE N SNPs TE_COV
+printf "  %-6s  %-32s  %-20s  %-14s  %4s  %5s  %8s\n" \
+    "------" "------" "-------" "--" "---" "----" "------"
+
+grep -E "^  (OK|SKIP)" "$LOG" 2>/dev/null | \
+while IFS= read -r line; do
+    status=$(echo "$line"  | awk '{print $1}')
+    file=$(echo "$line"    | awk '{print $2}')
+    ins=$(echo "$line"     | grep -oP 'ins=\S+')
+    te=$(echo "$line"      | grep -oP 'te=\S+')
+    n=$(echo "$line"       | grep -oP 'n=\K[0-9]+')
+    snps=$(echo "$line"    | grep -oP 'SNPs=\K[0-9]+')
+    tecov=$(echo "$line"   | grep -oP 'TE_cov=\S+')
+    printf "  %-6s  %-32s  %-20s  %-14s  %4s  %5s  %8s\n" \
+        "$status" "$file" "${ins#ins=}" "${te#te=}" "$n" "$snps" "${tecov#TE_cov=}"
+done || echo "  (none)"
 
 echo ""
-echo "=== Results ==="
-echo "Junction files:"
-ls -lh "$TEST_OUTDIR"/junction_*.fasta 2>/dev/null || echo "  (none)"
+n_ok=$(grep -c "^  OK" "$LOG" 2>/dev/null || echo 0)
+n_skip=$(grep -c "^  SKIP" "$LOG" 2>/dev/null || echo 0)
+echo "  Written: $n_ok    Skipped (SNPs>max): $n_skip"
 
-echo ""
-echo "BLAST hit counts:"
-echo "  reads_vs_te.tsv:  $(wc -l < "$TEST_OUTDIR/reads_vs_te.tsv" 2>/dev/null || echo 0) hits"
-echo "  reads_vs_ref.tsv: $(wc -l < "$TEST_OUTDIR/reads_vs_ref.tsv" 2>/dev/null || echo 0) hits"
-
-echo ""
-echo "=== First junction file (if any) ==="
-first=$(ls "$TEST_OUTDIR"/junction_*.fasta 2>/dev/null | head -1)
+# ------------------------------------------------------------------
+# Show first written junction file as a spot-check
+# ------------------------------------------------------------------
+first=$(grep "^  OK" "$LOG" 2>/dev/null | head -1 | awk '{print $2}')
 if [ -n "$first" ]; then
-    cat "$first"
-else
-    echo "  (none produced)"
+    echo ""
+    echo "=== Spot-check: $first ==="
+    cat "$TEST_OUTDIR/$first" 2>/dev/null || cat "$first" 2>/dev/null || true
 fi

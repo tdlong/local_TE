@@ -237,6 +237,10 @@ def main():
                     help='Minor-allele frequency threshold for IUPAC (default 0.15)')
     ap.add_argument('--min-flank',    type=int,   default=10,
                     help='Min bases each side of anchor in a read (default 10)')
+    ap.add_argument('--max-snps',     type=int,   default=10,
+                    help='Max IUPAC codes in Pre consensus before skipping '
+                         '(default 10); high counts indicate merged clusters '
+                         'from multiple nearby insertions')
     args = ap.parse_args()
 
     outdir       = args.outdir
@@ -245,6 +249,7 @@ def main():
     min_support  = args.min_support
     snp_min_freq = args.snp_min_freq
     min_flank    = args.min_flank
+    max_snps     = args.max_snps
 
     chrom        = region.split(':')[0]
     region_start = int(region.split(':')[1].split('-')[0])   # 1-based genomic
@@ -437,6 +442,18 @@ def main():
             out_name = os.path.join(
                 outdir, f"junction_{side}_{cluster_id:03d}.fasta")
 
+            iupac_count = sum(1 for c in pre_seq if c not in 'ACGTN')
+            # TE coverage: non-N bases in the TE half of Pre
+            te_half  = pre_seq[half:] if side == 'left' else pre_seq[:half]
+            te_cov   = sum(1 for c in te_half if c != 'N')
+
+            tag = f"ins={chrom}:{abs_ins_pos}  te={te_name}  n={len(anchored)}  SNPs={iupac_count}  TE_cov={te_cov}/{half}"
+
+            if iupac_count > max_snps:
+                print(f"  SKIP {os.path.basename(out_name)}  {tag}"
+                      f"  ← SNPs>{max_snps}, likely merged clusters")
+                continue
+
             with open(out_name, 'w') as fh:
                 fh.write(f">WT_REF[{abs_gstart}:{abs_gend}] "
                          f"insertion={chrom}:{abs_ins_pos} "
@@ -447,10 +464,7 @@ def main():
                 fh.write(pre_seq + '\n')
                 fh.write(f">{te_name}\n" + te_sub + '\n')
 
-            iupac_count = sum(1 for c in pre_seq if c not in 'ACGTN')
-            print(f"  Wrote {out_name}  "
-                  f"ins={chrom}:{abs_ins_pos}  te={te_name}  "
-                  f"n={len(anchored)}  SNPs={iupac_count}")
+            print(f"  OK   {os.path.basename(out_name)}  {tag}")
             n_written += 1
 
     print(f"\nPhase 1 (read-level discovery): {n_written} junction files written")
