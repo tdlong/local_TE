@@ -50,17 +50,14 @@ echo "BAMs:    ${BAM_PATHS[*]}"
 echo "Outdir:  $TEST_OUTDIR"
 echo "REF:     $REF"
 echo "TEFASTA: $TEFASTA"
+if [ -s "$TEST_OUTDIR/R1.fq" ]; then
+    echo ""
+    echo "NOTE: $TEST_OUTDIR/R1.fq exists — BAM extraction will be skipped."
+    echo "      Delete it to force re-extraction."
+fi
 echo ""
 
-# Remove old test output so we start clean
-rm -rf "$TEST_OUTDIR"
-
-# Patch run_te_assembly.sh to log to stdout instead of pipeline.log
-# by temporarily unsetting the exec redirect.  We do this by calling
-# the script with a wrapper that removes the exec redirect line.
-# Simpler approach: just run it; pipeline.log is created inside OUTDIR,
-# but we can tail it live in a second terminal.  Here we just run and
-# let the script write its log, then print it at the end.
+# pipeline.log is written inside OUTDIR; print it at the end.
 
 REF="$REF" TEFASTA="$TEFASTA" \
     bash scripts/run_te_assembly.sh \

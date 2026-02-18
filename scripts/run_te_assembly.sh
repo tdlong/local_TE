@@ -49,6 +49,18 @@ echo "BAMs (${#BAMS[@]}): ${BAMS[*]}"
 echo "OUTDIR: $OUTDIR"
 
 #=============================================================================
+# SECTIONS 1+2: Extract candidate reads from BAMs
+#   Skip if R1.fq and region.fasta already exist (re-extraction takes ~15 min).
+#   Delete R1.fq to force a fresh extraction.
+#=============================================================================
+if [ -s "$OUTDIR/R1.fq" ] && [ -s "$OUTDIR/region.fasta" ]; then
+    n_cached=$(grep -c '^@' "$OUTDIR/R1.fq" 2>/dev/null || echo 0)
+    echo ""
+    echo "=== Sections 1+2: Skipped (reads already extracted) ==="
+    echo "  R1.fq: $n_cached reads  |  delete $OUTDIR/R1.fq to re-extract"
+else
+
+#-----------------------------------------------------------------------------
 # SECTION 1: Extract candidate reads from ALL BAMs
 #   Criterion: maps to region (MAPQ>=20, primary) AND mate is NOT on the
 #   same chromosome ($7 != "="). This captures in one pass:
@@ -56,7 +68,7 @@ echo "OUTDIR: $OUTDIR"
 #     - Junction: mate unmapped
 #     - Discordant: mate maps to different chromosome (TE copy elsewhere)
 #   Exclude: reads near region ends pointing outward (boundary, not TE)
-#=============================================================================
+#-----------------------------------------------------------------------------
 echo ""
 echo "=== Section 1: Extract candidate reads (pooled from ${#BAMS[@]} BAMs) ==="
 module load samtools/1.15.1
@@ -87,11 +99,11 @@ done
 sort -u "$OUTDIR/candidates_all.txt" > "$OUTDIR/candidates.txt"
 echo "Total candidates: $(wc -l < "$OUTDIR/candidates.txt")"
 
-#=============================================================================
+#-----------------------------------------------------------------------------
 # SECTION 2: Extract paired-end reads
 #   Extract all alignments for candidate read names, name-sort, then
 #   convert to paired-end FASTQ.
-#=============================================================================
+#-----------------------------------------------------------------------------
 echo ""
 echo "=== Section 2: Extract paired-end reads (pooled) ==="
 
@@ -135,6 +147,8 @@ samtools faidx "$REF" "$REGION" > "$OUTDIR/region.fasta"
 # Clean up temp BAMs
 rm -f "$OUTDIR"/cand_*.bam "$OUTDIR/cand_bam_list.txt" "$OUTDIR/candidates_namesorted.bam"
 
+fi  # end of skip block
+
 #=============================================================================
 # SECTION 3: Read-level junction discovery
 #   BLAST individual reads against TE DB and reference region to identify
@@ -144,6 +158,8 @@ rm -f "$OUTDIR"/cand_*.bam "$OUTDIR/cand_bam_list.txt" "$OUTDIR/candidates_names
 #=============================================================================
 echo ""
 echo "=== Section 3: Read-level junction discovery ==="
+# Remove stale junction files so re-runs don't mix old and new results
+rm -f "$OUTDIR"/junction_*.fasta
 module load ncbi-blast/2.13.0
 module load python/3.10.2
 
