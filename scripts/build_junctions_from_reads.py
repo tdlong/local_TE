@@ -625,7 +625,7 @@ def main():
             te_cov   = sum(1 for c in te_half if c != 'N')
 
             canon_str = f"  can={n_canon_fill}" if n_canon_fill else ''
-            tag = (f"ins={chrom}:{abs_ins_pos}  te={te_name}  n={len(anchored)}"
+            tag = (f"ins={chrom}:{abs_ins_pos}  te={te_name}  reads={len(anchored)}"
                    f"  SNPs={iupac_count}  TE_cov={read_te_cov}/{half}"
                    f"  filled={te_cov}/{half}{canon_str}")
 
