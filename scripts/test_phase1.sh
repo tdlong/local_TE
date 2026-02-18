@@ -59,10 +59,10 @@ grep -E "raw clusters" "$LOG" 2>/dev/null || true
 echo ""
 echo "Junction results (OK=written  SKIP=too many SNPs):"
 echo ""
-printf "  %-6s  %-32s  %-20s  %-14s  %4s  %5s  %8s\n" \
-    STATUS FILE INS_POS TE N SNPs TE_COV
-printf "  %-6s  %-32s  %-20s  %-14s  %4s  %5s  %8s\n" \
-    "------" "------" "-------" "--" "---" "----" "------"
+printf "  %-6s  %-32s  %-20s  %-14s  %4s  %5s  %8s  %8s  %4s\n" \
+    STATUS FILE INS_POS TE N SNPs TE_COV FILLED CAN
+printf "  %-6s  %-32s  %-20s  %-14s  %4s  %5s  %8s  %8s  %4s\n" \
+    "------" "------" "-------" "--" "---" "----" "------" "------" "---"
 
 grep -E "^  (OK|SKIP)" "$LOG" 2>/dev/null | \
 while IFS= read -r line; do
@@ -73,8 +73,11 @@ while IFS= read -r line; do
     n=$(echo "$line"       | grep -oP 'n=\K[0-9]+')
     snps=$(echo "$line"    | grep -oP 'SNPs=\K[0-9]+')
     tecov=$(echo "$line"   | grep -oP 'TE_cov=\S+')
-    printf "  %-6s  %-32s  %-20s  %-14s  %4s  %5s  %8s\n" \
-        "$status" "$file" "${ins#ins=}" "${te#te=}" "$n" "$snps" "${tecov#TE_cov=}"
+    filled=$(echo "$line"  | grep -oP 'filled=\S+')
+    can=$(echo "$line"     | grep -oP 'can=\K[0-9]+')
+    printf "  %-6s  %-32s  %-20s  %-14s  %4s  %5s  %8s  %8s  %4s\n" \
+        "$status" "$file" "${ins#ins=}" "${te#te=}" "$n" "$snps" \
+        "${tecov#TE_cov=}" "${filled#filled=}" "${can:-0}"
 done || echo "  (none)"
 
 echo ""

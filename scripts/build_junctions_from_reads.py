@@ -245,6 +245,35 @@ def compute_te_only_anchor(read_id, te_hit, te_junc_coord, canonical_te_strand,
     return seq, anchor_0
 
 
+def canonical_te_half(te_seq, te_junc_coord, canon_te_strand, side, half=50):
+    """
+    Extract `half` bp of canonical TE sequence to fill the TE half of the
+    junction consensus.
+
+    Coordinate logic (te_junc_coord is 1-based from BLAST):
+      RIGHT, plus  → te_seq[te_junc_coord-half : te_junc_coord]   (forward)
+      RIGHT, minus → RC(te_seq[te_junc_coord-1 : te_junc_coord-1+half])
+      LEFT,  plus  → te_seq[te_junc_coord-1    : te_junc_coord-1+half] (forward)
+      LEFT,  minus → RC(te_seq[te_junc_coord-half : te_junc_coord])
+
+    Returns None if the window is out of bounds or te_seq is empty.
+    """
+    if not te_seq:
+        return None
+    if side == 'right' and canon_te_strand == 'plus':
+        s, e, do_rc = te_junc_coord - half, te_junc_coord, False
+    elif side == 'right' and canon_te_strand == 'minus':
+        s, e, do_rc = te_junc_coord - 1, te_junc_coord - 1 + half, True
+    elif side == 'left' and canon_te_strand == 'plus':
+        s, e, do_rc = te_junc_coord - 1, te_junc_coord - 1 + half, False
+    else:  # left, minus
+        s, e, do_rc = te_junc_coord - half, te_junc_coord, True
+    if s < 0 or e > len(te_seq):
+        return None
+    fill = te_seq[s:e]
+    return revcomp(fill) if do_rc else fill
+
+
 # ---------------------------------------------------------------------------
 # Consensus building
 # ---------------------------------------------------------------------------
@@ -558,9 +587,31 @@ def main():
                 continue
             abs_seq = region_seq[abs_start:abs_end]
 
-            # TE record (visualization only): relevant end of the TE
+            # Load full TE sequence for canonical fill and visualization
             te_full = te_seq_dict.get(te_name, '')
             te_sub  = te_full[:100] if side == 'left' else te_full[-100:]
+
+            # TE coverage from reads BEFORE canonical fill
+            te_half_pre = pre_seq[half:] if side == 'left' else pre_seq[:half]
+            read_te_cov = sum(1 for c in te_half_pre if c != 'N')
+
+            # Fill N positions in TE half with canonical TE sequence
+            n_canon_fill = 0
+            canon_fill = canonical_te_half(
+                te_full, te_junc_coord, canon_te_strand, side, half)
+            if canon_fill:
+                pre_list = list(pre_seq)
+                if side == 'right':
+                    for j in range(half):
+                        if pre_list[j] == 'N' and canon_fill[j] in 'ACGT':
+                            pre_list[j] = canon_fill[j]
+                            n_canon_fill += 1
+                else:
+                    for j in range(half):
+                        if pre_list[half + j] == 'N' and canon_fill[j] in 'ACGT':
+                            pre_list[half + j] = canon_fill[j]
+                            n_canon_fill += 1
+                pre_seq = ''.join(pre_list)
 
             abs_gstart = region_start + abs_start        # 1-based genomic
             abs_gend   = abs_gstart + len(abs_seq) - 1
@@ -569,11 +620,14 @@ def main():
                 outdir, f"junction_{side}_{cluster_id:03d}.fasta")
 
             iupac_count = sum(1 for c in pre_seq if c not in 'ACGTN')
-            # TE coverage: non-N bases in the TE half of Pre
+            # TE coverage after canonical fill
             te_half  = pre_seq[half:] if side == 'left' else pre_seq[:half]
             te_cov   = sum(1 for c in te_half if c != 'N')
 
-            tag = f"ins={chrom}:{abs_ins_pos}  te={te_name}  n={len(anchored)}  SNPs={iupac_count}  TE_cov={te_cov}/{half}"
+            canon_str = f"  can={n_canon_fill}" if n_canon_fill else ''
+            tag = (f"ins={chrom}:{abs_ins_pos}  te={te_name}  n={len(anchored)}"
+                   f"  SNPs={iupac_count}  TE_cov={read_te_cov}/{half}"
+                   f"  filled={te_cov}/{half}{canon_str}")
 
             if iupac_count > max_snps:
                 print(f"  SKIP {os.path.basename(out_name)}  {tag}"
