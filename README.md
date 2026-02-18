@@ -148,9 +148,13 @@ Consensus built from junction reads — reads that have sequence matching
   haplotypes in a pooled population sample. IUPAC codes follow the same case rule
   as the bases around them. Phase 2 expands each IUPAC k-mer into all concrete
   variants so every haplotype is counted.
-- **N (uppercase, in TE half):** No read coverage at that position — reads don't
-  extend that far into the TE. The `TE_cov` metric in the run log counts non-N
-  bases in the TE half; higher is better (more diagnostic k-mers for Phase 2).
+- **N (uppercase, in TE half):** Position filled from the **canonical TE sequence**
+  in the database (see below). After read-based consensus building, any N positions
+  in the TE half are replaced with the known TE sequence oriented correctly for the
+  junction. The log reports `TE_cov=14/50` (read-supported bases before fill) and
+  `filled=50/50` (total non-N bases after fill) and `can=36` (positions from
+  canonical). If the canonical TE is not in the database for this TE name, N's
+  remain.
 
 **Record 4 — TE canonical sequence**
 
@@ -175,13 +179,13 @@ junction is the reference flank:
 RIGHT junction (type=right):
   Read layout:   [--- TE end (50 bp) ---][--- ref right flank (50 bp) ---]
   Position:       0                     50                              99
-  reads_consensus: TE bases → N (no cov)  |  matches WT_REF from pos 50
+  reads_consensus: TE bases (read+canon)  |  matches WT_REF from pos 50
   WT_REF:          ref left flank         |  ref right flank
 
 LEFT junction (type=left):
   Read layout:   [--- ref left flank (50 bp) ---][--- TE start (50 bp) ---]
   Position:       0                             50                        99
-  reads_consensus: matches WT_REF to pos 50     |  TE bases → N (no cov)
+  reads_consensus: matches WT_REF to pos 50     |  TE bases (read+canon)
   WT_REF:          ref left flank               |  ref right flank
 ```
 
@@ -211,9 +215,11 @@ Using the right-junction example above (`insertion=chr3L:8733858, te=FBte0000559
    flagged as SKIP by the pipeline) suggests two different nearby insertions were
    accidentally merged into one cluster.
 
-5. **Low TE_cov (< 20/50):** These junctions are real but will produce fewer Phase 2
-   k-mers. Genotyping accuracy may be lower; treat genotype calls for these junctions
-   with caution.
+5. **TE_cov and filled:** `TE_cov=14/50` means only 14 of 50 TE-half positions were
+   covered by reads; the other 36 were filled from the canonical TE database sequence
+   (`can=36`, `filled=50/50`). The filled positions are diagnostic only if the TE
+   sequence is sufficiently unique at that location — which is usually true for the
+   TE/reference boundary but worth verifying for highly repetitive TEs.
 
 ## Building the Competitive Reference
 
@@ -320,6 +326,25 @@ local_TE/
     ├── extract_junction_kmers.py        # Phase 2 k-mer extraction
     └── genotype_from_counts.py          # Phase 2 genotyping
 ```
+
+## Future Improvements
+
+### Insert-size guided junction spanning reads (Phase 1)
+
+The current approach fills N's in the TE half with canonical TE sequence. A more principled
+alternative would recover reads that physically span the junction but were not captured as
+junction reads:
+
+1. **Round 1 (current):** identify the insertion position and TE from junction reads.
+2. **Round 2:** scan the BAM for reads where (a) R1 maps uniquely to the reference within
+   ~insert_size bp of the insertion point and points **toward** the insertion, and (b) R2 is
+   unmapped or maps poorly. Given (a), it is almost certain that R2 spans the junction. Extract
+   these R2 reads and incorporate them into the consensus before building junction files.
+
+This would produce read-supported sequence for the full TE half rather than canonical fill,
+capturing real sequence variation at the TE/reference boundary (e.g. TSDs). It requires
+knowing the insert size distribution from the BAM (`samtools stats`) and an additional BAM
+pass per region. Estimated: ~300 additional lines of shell + Python.
 
 ## Troubleshooting
 
