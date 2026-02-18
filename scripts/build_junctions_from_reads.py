@@ -4,25 +4,32 @@ build_junctions_from_reads.py
 
 Read-level TE junction discovery. Replaces SPAdes assembly (Sections 3-7 of
 run_te_assembly.sh). BLAST individual reads directly against the TE database
-and the reference region, find junction reads (hits to both), cluster by
+and the reference region, identify junction reads (hits to both), cluster by
 inferred insertion position, and build consensus junction sequences.
+
+Key design: reads are anchored at the GENOMICALLY-DERIVED insertion point
+(cluster median position back-projected through the reference alignment), not
+at te_qstart.  BLAST can place te_qstart ±3-5bp differently across reads from
+the same junction; that jitter makes every column look like a SNP with only
+2-3 reads.  The reference alignment is much more precisely constrained and
+gives a consistent anchor across all reads in a cluster.
 
 Writes one junction_<type>_<N>.fasta per cluster (compatible with
 build_junctions_ref.py 4-record format).
 
 Usage:
     python build_junctions_from_reads.py \\
-        --outdir  <outdir>      \\  # contains R1.fq R2.fq singles.fq region.fasta
-        --te-fasta <te.fasta>   \\
+        --outdir  <outdir>        \\   # contains R1.fq R2.fq singles.fq region.fasta
+        --te-fasta <te.fasta>     \\
         --region  <chr:start-end> \\
-        [--min-support 3]       \\
-        [--snp-min-freq 0.15]
+        [--min-support 3]         \\
+        [--snp-min-freq 0.15]     \\
+        [--min-flank 10]
 """
 
 import argparse
 import os
 import subprocess
-import sys
 from collections import defaultdict
 
 from Bio import SeqIO
@@ -30,7 +37,7 @@ from Bio.Seq import Seq
 
 
 # ---------------------------------------------------------------------------
-# IUPAC encoding helpers
+# IUPAC encoding
 # ---------------------------------------------------------------------------
 IUPAC_FROM_BASES = {
     frozenset('A'):    'A',
@@ -51,24 +58,37 @@ IUPAC_FROM_BASES = {
 }
 
 
-def bases_to_iupac(counts, snp_min_freq):
-    """Return IUPAC code for a column given base counts {A:n, C:n, G:n, T:n}.
+def bases_to_iupac(counts, snp_min_freq, snp_min_count=2):
+    """
+    Return IUPAC code for a base-count column.
 
-    Major allele is always included. Any additional allele with frequency >=
-    snp_min_freq is also included (IUPAC ambiguity).
-    Returns '-' if no coverage.
+    The major allele is always represented.  A minor allele is included only
+    when it meets BOTH thresholds:
+      - count >= snp_min_count (default 2) — prevents single sequencing errors
+      - frequency >= snp_min_freq — prevents low-frequency noise
+
+    With snp_min_count=2 you need at least 3 reads to encode any IUPAC
+    ambiguity (2 showing the minor allele + 1 or more showing the major).
+    This keeps the consensus clean at low depth.
     """
     total = sum(counts.values())
     if total == 0:
         return 'N'
-    present = {b for b, n in counts.items() if n / total >= snp_min_freq}
-    key = frozenset(present)
-    return IUPAC_FROM_BASES.get(key, 'N')
+    major = max(counts, key=counts.get)
+    present = {major}
+    for b, n in counts.items():
+        if b != major and n >= snp_min_count and n / total >= snp_min_freq:
+            present.add(b)
+    return IUPAC_FROM_BASES.get(frozenset(present), major)
 
 
 # ---------------------------------------------------------------------------
-# FASTQ → FASTA
+# Utilities
 # ---------------------------------------------------------------------------
+def revcomp(seq):
+    return str(Seq(seq).reverse_complement())
+
+
 def fastq_to_fasta(fq_paths, out_fa):
     """Concatenate one or more FASTQ files into a single FASTA."""
     with open(out_fa, 'w') as fh:
@@ -79,29 +99,23 @@ def fastq_to_fasta(fq_paths, out_fa):
                 while True:
                     header = f.readline().rstrip()
                     seq    = f.readline().rstrip()
-                    plus   = f.readline()
-                    qual   = f.readline()
+                    f.readline()   # +
+                    f.readline()   # qual
                     if not header:
                         break
-                    name = header[1:].split()[0]   # strip @, take first token
+                    name = header[1:].split()[0]
                     fh.write(f">{name}\n{seq}\n")
 
 
 # ---------------------------------------------------------------------------
-# BLAST helpers
+# BLAST
 # ---------------------------------------------------------------------------
 BLAST_FMT = "6 qseqid sseqid qstart qend sstart send sstrand"
 
 
 def run_blastn(query, subject, out_tsv, evalue="1e-5"):
-    cmd = [
-        "blastn",
-        "-query", query,
-        "-subject", subject,
-        "-outfmt", BLAST_FMT,
-        "-evalue", evalue,
-        "-out", out_tsv,
-    ]
+    cmd = ["blastn", "-query", query, "-subject", subject,
+           "-outfmt", BLAST_FMT, "-evalue", evalue, "-out", out_tsv]
     subprocess.run(cmd, check=True, stderr=subprocess.DEVNULL)
 
 
@@ -112,10 +126,7 @@ def parse_best_hits(tsv_path):
         return best
     with open(tsv_path) as f:
         for line in f:
-            line = line.rstrip()
-            if not line:
-                continue
-            parts = line.split('\t')
+            parts = line.rstrip().split('\t')
             if len(parts) < 7:
                 continue
             qid, sid, qstart, qend, sstart, send, sstrand = parts[:7]
@@ -124,65 +135,91 @@ def parse_best_hits(tsv_path):
             span = qend - qstart + 1
             if qid not in best or span > best[qid]['span']:
                 best[qid] = {
-                    'subject':  sid,
-                    'qstart':   qstart,   # 1-based
-                    'qend':     qend,
-                    'sstart':   sstart,
-                    'send':     send,
-                    'sstrand':  sstrand,
-                    'span':     span,
+                    'subject': sid,
+                    'qstart': qstart, 'qend': qend,
+                    'sstart': sstart, 'send': send,
+                    'sstrand': sstrand, 'span': span,
                 }
     return best
 
 
 # ---------------------------------------------------------------------------
-# Reverse complement
+# Anchor computation
 # ---------------------------------------------------------------------------
-def revcomp(seq):
-    return str(Seq(seq).reverse_complement())
-
-
-# ---------------------------------------------------------------------------
-# Consensus building with IUPAC SNP encoding
-# ---------------------------------------------------------------------------
-def build_consensus(seqs_at_anchor, half=50, snp_min_freq=0.15):
+def compute_anchor(jr, cluster_ins_region, read_seqs, min_flank):
     """
-    Build a 2*half bp consensus centred at column `half` (0-based).
+    Back-project the cluster's consensus insertion position (1-based in
+    region.fasta) through the read's reference alignment to get the 0-based
+    position in the read that corresponds to the insertion point.
 
-    seqs_at_anchor: list of (seq, anchor_col) where anchor_col is the
-    position within `seq` that corresponds to the junction (will be placed
-    at column `half` of the output).
+    For minus-strand reads the read is reverse-complemented so that the
+    returned sequence is in forward genomic orientation.
 
-    Returns None if no reads cover position `half`.
+    Returns (oriented_seq, anchor_0based), or None if the insertion falls
+    within min_flank bases of either end of the read.
+
+    Coordinate math:
+      plus strand:  subject_pos = ref_sstart + (query_pos - ref_qstart)
+                    → query_pos = ref_qstart + (subject_pos - ref_sstart)
+      minus strand: subject_pos = ref_sstart - (query_pos - ref_qstart)
+                    → query_pos = ref_qstart + (ref_sstart - subject_pos)
+      After RC'ing a minus-strand read, position p becomes (len-1-p).
     """
-    width = 2 * half
+    seq = read_seqs.get(jr['read_id'])
+    if not seq:
+        return None
+
+    ref_qstart_0 = jr['ref_qstart'] - 1   # 0-based in original read
+    ref_sstart   = jr['ref_sstart']        # 1-based in region.fasta
+
+    if jr['ref_strand'] == 'plus':
+        anchor_0 = ref_qstart_0 + (cluster_ins_region - ref_sstart)
+    else:
+        anchor_0 = ref_qstart_0 + (ref_sstart - cluster_ins_region)
+        seq      = revcomp(seq)
+        anchor_0 = len(seq) - 1 - anchor_0
+
+    anchor_0 = int(round(anchor_0))
+
+    if anchor_0 < min_flank or anchor_0 >= len(seq) - min_flank:
+        return None
+
+    return seq, anchor_0
+
+
+# ---------------------------------------------------------------------------
+# Consensus building
+# ---------------------------------------------------------------------------
+def build_consensus(anchored_reads, half=50, snp_min_freq=0.15):
+    """
+    Build a 2*half bp consensus with column `half` at the insertion point.
+
+    anchored_reads: list of (oriented_seq, anchor_0based)
+    Returns None if no reads cover the anchor column itself.
+    """
+    width  = 2 * half
     counts = [defaultdict(int) for _ in range(width)]
 
-    for seq, anchor in seqs_at_anchor:
-        # offset so that seq[anchor] → column half
+    for seq, anchor in anchored_reads:
         col_offset = half - anchor
         for i, base in enumerate(seq.upper()):
             col = i + col_offset
             if 0 <= col < width and base in 'ACGT':
                 counts[col][base] += 1
 
-    # Check coverage at the junction column itself
     if sum(counts[half].values()) == 0:
         return None
 
-    consensus = ''.join(bases_to_iupac(counts[col], snp_min_freq)
-                        for col in range(width))
-    return consensus
+    return ''.join(bases_to_iupac(counts[col], snp_min_freq)
+                   for col in range(width))
 
 
 # ---------------------------------------------------------------------------
-# Load reads.fasta into dict
+# Load helpers
 # ---------------------------------------------------------------------------
 def load_reads(fa_path):
-    reads = {}
-    for rec in SeqIO.parse(fa_path, 'fasta'):
-        reads[rec.id] = str(rec.seq).upper()
-    return reads
+    return {rec.id: str(rec.seq).upper()
+            for rec in SeqIO.parse(fa_path, 'fasta')}
 
 
 # ---------------------------------------------------------------------------
@@ -190,12 +227,16 @@ def load_reads(fa_path):
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--outdir',      required=True)
-    ap.add_argument('--te-fasta',    required=True)
-    ap.add_argument('--region',      required=True,
-                    help='Region string, e.g. chr3L:8710861-8744900')
-    ap.add_argument('--min-support', type=int, default=3)
-    ap.add_argument('--snp-min-freq', type=float, default=0.15)
+    ap.add_argument('--outdir',       required=True)
+    ap.add_argument('--te-fasta',     required=True)
+    ap.add_argument('--region',       required=True,
+                    help='e.g. chr3L:8710861-8744900')
+    ap.add_argument('--min-support',  type=int,   default=3,
+                    help='Min reads per cluster (default 3)')
+    ap.add_argument('--snp-min-freq', type=float, default=0.15,
+                    help='Minor-allele frequency threshold for IUPAC (default 0.15)')
+    ap.add_argument('--min-flank',    type=int,   default=10,
+                    help='Min bases each side of anchor in a read (default 10)')
     args = ap.parse_args()
 
     outdir       = args.outdir
@@ -203,100 +244,97 @@ def main():
     region       = args.region
     min_support  = args.min_support
     snp_min_freq = args.snp_min_freq
+    min_flank    = args.min_flank
 
-    # -----------------------------------------------------------------------
-    # Parse region coordinates
-    # -----------------------------------------------------------------------
     chrom        = region.split(':')[0]
-    coords       = region.split(':')[1]
-    region_start = int(coords.split('-')[0])   # 1-based genomic start
+    region_start = int(region.split(':')[1].split('-')[0])   # 1-based genomic
 
-    # -----------------------------------------------------------------------
-    # Step 1: Build reads.fasta (R1 + R2 + singles)
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Step 1: FASTQ → FASTA
+    # ------------------------------------------------------------------
     reads_fa = os.path.join(outdir, 'reads.fasta')
-    fq_files = [
-        os.path.join(outdir, 'R1.fq'),
-        os.path.join(outdir, 'R2.fq'),
-        os.path.join(outdir, 'singles.fq'),
-    ]
-    print("Step 1: Converting FASTQ to FASTA")
-    fastq_to_fasta(fq_files, reads_fa)
-    n_reads = sum(1 for _ in open(reads_fa) if _.startswith('>'))
-    print(f"  {n_reads} reads in {reads_fa}")
-
+    fastq_to_fasta(
+        [os.path.join(outdir, f) for f in ('R1.fq', 'R2.fq', 'singles.fq')],
+        reads_fa)
+    n_reads = sum(1 for line in open(reads_fa) if line.startswith('>'))
+    print(f"Step 1: {n_reads} reads → {reads_fa}")
     if n_reads == 0:
-        print("  No reads found — no junctions to discover")
+        print("  No reads — nothing to discover")
         return
 
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Step 2: BLAST reads vs TE database and reference region
-    # -----------------------------------------------------------------------
-    region_fa   = os.path.join(outdir, 'region.fasta')
-    te_blast    = os.path.join(outdir, 'reads_vs_te.tsv')
-    ref_blast   = os.path.join(outdir, 'reads_vs_ref.tsv')
+    # ------------------------------------------------------------------
+    region_fa = os.path.join(outdir, 'region.fasta')
+    te_blast  = os.path.join(outdir, 'reads_vs_te.tsv')
+    ref_blast = os.path.join(outdir, 'reads_vs_ref.tsv')
 
     print("Step 2: BLAST reads vs TE database")
     run_blastn(reads_fa, te_fasta, te_blast)
-    print(f"  TE hits: {sum(1 for _ in open(te_blast) if _.strip())}")
+    print(f"  TE hits: {sum(1 for l in open(te_blast) if l.strip())}")
 
     print("Step 2: BLAST reads vs reference region")
     run_blastn(reads_fa, region_fa, ref_blast)
-    print(f"  Ref hits: {sum(1 for _ in open(ref_blast) if _.strip())}")
+    print(f"  Ref hits: {sum(1 for l in open(ref_blast) if l.strip())}")
 
     te_hits  = parse_best_hits(te_blast)
     ref_hits = parse_best_hits(ref_blast)
 
-    # -----------------------------------------------------------------------
-    # Step 3: Find junction reads (hits to both TE and ref)
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Step 3: Identify junction reads; infer insertion position and type
+    #
+    # Junction type (LEFT vs RIGHT) describes the read's layout relative
+    # to the TE insertion in GENOMIC forward orientation:
+    #   LEFT:  [ref_sequence | TE_sequence]  in the read
+    #   RIGHT: [TE_sequence  | ref_sequence] in the read
+    #
+    # For plus-strand ref hits:
+    #   ref alignment precedes TE alignment in the read → LEFT
+    # For minus-strand ref hits the read is in reverse orientation, so the
+    # layout is flipped:
+    #   ref alignment precedes TE in original read → RIGHT (genomically)
+    # ------------------------------------------------------------------
     print("Step 3: Identifying junction reads")
-    junction_reads = []   # list of dicts
+    junction_reads = []
 
     for read_id in set(te_hits) & set(ref_hits):
         te_h  = te_hits[read_id]
         ref_h = ref_hits[read_id]
 
-        te_qstart  = te_h['qstart']   # 1-based position in read where TE starts
-        ref_qstart = ref_h['qstart']  # 1-based position in read where ref starts
+        te_qstart  = te_h['qstart']
+        ref_qstart = ref_h['qstart']
 
-        # Infer insertion point in genomic coordinates
+        # Infer insertion position in region.fasta coords (1-based)
         if ref_h['sstrand'] == 'plus':
-            ins_pos = ref_h['sstart'] + (te_qstart - ref_qstart)
-            # junction type: ref alignment is to the left of TE hit in read?
+            ins_region = ref_h['sstart'] + (te_qstart - ref_qstart)
             jtype = 'left' if ref_qstart < te_qstart else 'right'
         else:
-            ins_pos = ref_h['sstart'] - (te_qstart - ref_qstart)
-            jtype = 'left' if ref_qstart < te_qstart else 'right'
-
-        # Convert to absolute genomic coordinate
-        # (sstart in BLAST is 1-based offset within the extracted region)
-        abs_ins_pos = region_start + ins_pos - 1
+            ins_region = ref_h['sstart'] - (te_qstart - ref_qstart)
+            # Minus-strand: layout is flipped — opposite of plus-strand rule
+            jtype = 'right' if ref_qstart < te_qstart else 'left'
 
         junction_reads.append({
-            'read_id':     read_id,
-            'te_name':     te_h['subject'],
-            'te_qstart':   te_qstart,    # 1-based
-            'ref_qstart':  ref_qstart,   # 1-based
-            'ref_strand':  ref_h['sstrand'],
-            'ins_pos':     abs_ins_pos,
-            'jtype':       jtype,
+            'read_id':    read_id,
+            'te_name':    te_h['subject'],
+            'ref_qstart': ref_qstart,
+            'ref_sstart': ref_h['sstart'],
+            'ref_strand': ref_h['sstrand'],
+            'ins_region': ins_region,          # 1-based in region.fasta
+            'ins_pos':    region_start + ins_region - 1,  # 1-based genomic
+            'jtype':      jtype,
         })
 
     print(f"  Found {len(junction_reads)} junction reads")
     if not junction_reads:
-        print("  No junction reads — no clusters to build")
         return
 
-    # -----------------------------------------------------------------------
-    # Step 4: Cluster by inferred insertion position (±20bp)
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Step 4: Cluster by inferred insertion position (±20bp), then filter
+    # ------------------------------------------------------------------
     print("Step 4: Clustering by insertion position")
     junction_reads.sort(key=lambda r: r['ins_pos'])
-
-    clusters = []   # list of lists of reads
+    clusters = []
     current  = [junction_reads[0]]
-
     for jr in junction_reads[1:]:
         if abs(jr['ins_pos'] - current[0]['ins_pos']) <= 20:
             current.append(jr)
@@ -305,116 +343,95 @@ def main():
             current = [jr]
     clusters.append(current)
 
-    print(f"  {len(clusters)} raw clusters "
-          f"(≥{min_support} support required)")
+    raw_n = len(clusters)
+    clusters = [c for c in clusters if len(c) >= min_support]
+    print(f"  {raw_n} raw clusters → {len(clusters)} with ≥{min_support} reads")
 
-    # -----------------------------------------------------------------------
-    # Load reads into memory (needed for consensus building)
-    # -----------------------------------------------------------------------
-    read_seqs = load_reads(reads_fa)
+    if not clusters:
+        return
 
-    # -----------------------------------------------------------------------
-    # Load reference region and TE sequences for Abs and TE records
-    # -----------------------------------------------------------------------
-    region_seq_dict = {rec.id: str(rec.seq).upper()
-                       for rec in SeqIO.parse(region_fa, 'fasta')}
-    # region_fa has one record; take its sequence
-    region_seq = next(iter(region_seq_dict.values()))
+    # ------------------------------------------------------------------
+    # Load sequences
+    # ------------------------------------------------------------------
+    read_seqs   = load_reads(reads_fa)
+    region_seq  = next(
+        str(r.seq).upper() for r in SeqIO.parse(region_fa, 'fasta'))
+    te_seq_dict = {r.id: str(r.seq).upper()
+                   for r in SeqIO.parse(te_fasta, 'fasta')}
 
-    te_seq_dict = {rec.id: str(rec.seq).upper()
-                   for rec in SeqIO.parse(te_fasta, 'fasta')}
-
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Step 5–8: Build consensus and write junction FASTA files
-    # -----------------------------------------------------------------------
-    half = 50   # junction centred at column 50 (0-based) of a 100bp window
-
+    # ------------------------------------------------------------------
+    half      = 50
     n_written = 0
+
     for cluster_id, cluster in enumerate(clusters):
-        # Separate LEFT and RIGHT junction reads
         left_reads  = [r for r in cluster if r['jtype'] == 'left']
         right_reads = [r for r in cluster if r['jtype'] == 'right']
 
-        # Determine representative insertion position and TE name (majority)
-        all_te_names = [r['te_name'] for r in cluster]
-        te_name = max(set(all_te_names), key=all_te_names.count)
+        # Majority TE name
+        all_te  = [r['te_name'] for r in cluster]
+        te_name = max(set(all_te), key=all_te.count)
 
-        med_pos = sorted(r['ins_pos'] for r in cluster)[len(cluster) // 2]
+        # Cluster consensus insertion position (median, 1-based in region.fasta)
+        ins_list           = sorted(r['ins_region'] for r in cluster)
+        cluster_ins_region = ins_list[len(ins_list) // 2]
+        abs_ins_pos        = region_start + cluster_ins_region - 1   # genomic
 
-        # Build consensus for whichever side has enough support
-        for side, side_reads, min_side in [('left',  left_reads,  2),
-                                            ('right', right_reads, 2)]:
-            if len(side_reads) < min(min_side, min_support):
+        for side, side_reads in [('left', left_reads), ('right', right_reads)]:
+            if len(side_reads) < 2:
                 continue
 
-            # Step 5: Anchor reads at the TE boundary
-            seqs_at_anchor = []
+            # Anchor each read at the genomically-derived insertion point
+            anchored = []
             for jr in side_reads:
-                seq = read_seqs.get(jr['read_id'])
-                if seq is None:
-                    continue
-                # Reverse-complement if ref hit was on minus strand
-                if jr['ref_strand'] == 'minus':
-                    seq = revcomp(seq)
-                if side == 'left':
-                    # anchor = te_qstart - 1 (convert to 0-based)
-                    anchor = jr['te_qstart'] - 1
-                else:  # right: ref begins after TE in the read
-                    anchor = jr['ref_qstart'] - 1
-                seqs_at_anchor.append((seq, anchor))
+                result = compute_anchor(jr, cluster_ins_region,
+                                        read_seqs, min_flank)
+                if result is not None:
+                    anchored.append(result)
 
-            pre_seq = build_consensus(seqs_at_anchor, half=half,
+            if len(anchored) < 2:
+                continue
+
+            pre_seq = build_consensus(anchored, half=half,
                                       snp_min_freq=snp_min_freq)
             if pre_seq is None:
-                print(f"  Cluster {cluster_id} {side}: consensus failed "
-                      f"(no coverage at junction)")
+                print(f"  Cluster {cluster_id} {side}: no coverage at anchor — skipped")
                 continue
 
-            # Step 6: Abs sequence — reference genome centred at insertion
-            # Convert med_pos (1-based genomic) to 0-based index in region_seq
-            ins_idx = med_pos - region_start   # 0-based offset into region_seq
+            # Abs: reference genome slice centred at insertion (no TE)
+            ins_idx   = cluster_ins_region - 1   # 0-based in region_seq
             abs_start = ins_idx - half
             abs_end   = ins_idx + half
             if abs_start < 0 or abs_end > len(region_seq):
-                print(f"  Cluster {cluster_id}: insertion near region boundary, "
-                      f"skipping")
+                print(f"  Cluster {cluster_id}: too close to region boundary — skipped")
                 continue
             abs_seq = region_seq[abs_start:abs_end]
 
-            # Step 7: TE sequence for visualization record
+            # TE record (visualization only): relevant end of the TE
             te_full = te_seq_dict.get(te_name, '')
-            if side == 'left':
-                te_sub = te_full[:100]
-            else:
-                te_sub = te_full[-100:] if len(te_full) >= 100 else te_full
+            te_sub  = te_full[:100] if side == 'left' else te_full[-100:]
 
-            # Step 8: Write junction FASTA (4-record format)
-            # Genomic window used for Abs
-            abs_gstart = region_start + abs_start        # 1-based
+            abs_gstart = region_start + abs_start        # 1-based genomic
             abs_gend   = abs_gstart + len(abs_seq) - 1
 
             out_name = os.path.join(
                 outdir, f"junction_{side}_{cluster_id:03d}.fasta")
 
             with open(out_name, 'w') as fh:
-                fh.write(
-                    f">WT_REF[{abs_gstart}:{abs_gend}] "
-                    f"insertion={chrom}:{med_pos} "
-                    f"te={te_name} "
-                    f"type={side}\n"
-                )
+                fh.write(f">WT_REF[{abs_gstart}:{abs_gend}] "
+                         f"insertion={chrom}:{abs_ins_pos} "
+                         f"te={te_name} type={side}\n")
                 fh.write(abs_seq + '\n')
-                fh.write(">REF\n")
-                fh.write(abs_seq + '\n')
+                fh.write(">REF\n" + abs_seq + '\n')
                 fh.write(f">reads_consensus_{side}_{cluster_id}\n")
                 fh.write(pre_seq + '\n')
-                fh.write(f">{te_name}\n")
-                fh.write(te_sub + '\n')
+                fh.write(f">{te_name}\n" + te_sub + '\n')
 
-            n_support = len(side_reads)
-            print(f"  Wrote {out_name} "
-                  f"(ins={chrom}:{med_pos}, te={te_name}, "
-                  f"n={n_support})")
+            iupac_count = sum(1 for c in pre_seq if c not in 'ACGTN')
+            print(f"  Wrote {out_name}  "
+                  f"ins={chrom}:{abs_ins_pos}  te={te_name}  "
+                  f"n={len(anchored)}  SNPs={iupac_count}")
             n_written += 1
 
     print(f"\nPhase 1 (read-level discovery): {n_written} junction files written")
