@@ -4,7 +4,7 @@ Two-phase pipeline: discover TE insertions from BAMs, then genotype them across 
 
 ## Phases
 
-**Phase 1 (Discovery):** Pool reads from BAMs per region, assemble with SPAdes, identify TE junction contigs (BLAST + minimap2), generate 100bp visual alignments, build `junctions.fa`.
+**Phase 1 (Discovery):** Pool reads from BAMs per region, BLAST individual reads against the TE database and reference region, identify junction reads (hits to both), cluster by inferred insertion position, build 100bp consensus sequences with IUPAC SNP encoding, and write `junction_*.fasta` files → `junctions.fa`.
 
 **Phase 2 (Genotyping):** Extract diagnostic k-mers from junction sequences, scan raw FASTQs with BBDuk, call genotypes from k-mer counts.
 
@@ -12,9 +12,7 @@ Two-phase pipeline: discover TE insertions from BAMs, then genotype them across 
 
 HPC modules:
 - `samtools/1.15.1`
-- `SPAdes/3.15.4`
 - `ncbi-blast/2.13.0`
-- `minimap2/2.28`
 - `python/3.10.2` with Biopython
 
 Conda:
@@ -48,7 +46,7 @@ local_TE/
 └── scripts/
     ├── submit_te_analysis.sh            # Phase 1 SLURM wrapper
     ├── run_te_assembly.sh               # Phase 1 pipeline
-    ├── build_te_alignment.py            # Phase 1 visualization
+    ├── build_junctions_from_reads.py    # Phase 1 read-level junction discovery
     ├── build_junctions_ref.py           # Build competitive reference
     ├── submit_te_kmer_count.sh          # Phase 2 SLURM orchestrator
     ├── run_te_kmer_count.sh             # Phase 2 BBDuk per-sample

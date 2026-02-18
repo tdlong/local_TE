@@ -4,7 +4,7 @@ A two-phase pipeline for detecting transposable element (TE) insertions from pai
 
 ## Overview
 
-**Phase 1 (Discovery):** Pool reads from all BAMs for each genomic region, assemble with SPAdes, identify TE junction contigs via BLAST/minimap2, and generate visual alignments.
+**Phase 1 (Discovery):** Pool reads from all BAMs for each genomic region, BLAST individual reads against the TE database and reference region, identify junction reads (hits to both), cluster by inferred insertion position, and build consensus junction sequences with IUPAC SNP encoding.
 
 **Phase 2 (Genotyping):** Extract diagnostic k-mers from junction sequences, scan raw FASTQs with BBDuk, and call genotypes from k-mer counts.
 
@@ -12,9 +12,7 @@ A two-phase pipeline for detecting transposable element (TE) insertions from pai
 
 HPC modules:
 - `samtools/1.15.1`
-- `SPAdes/3.15.4`
 - `ncbi-blast/2.13.0`
-- `minimap2/2.28`
 - `python/3.10.2` with Biopython
 
 Conda:
@@ -60,7 +58,11 @@ sbatch scripts/submit_te_kmer_count.sh
 
 ## Phase 1: Discovery
 
-All BAMs are pooled per region to maximize assembly coverage. Output is one directory per region (not per BAM).
+All BAMs are pooled per region. Each read is BLASTed against the TE database
+and the reference region; reads with hits to both are junction reads. These
+are clustered by inferred insertion position and a consensus is built with
+IUPAC ambiguity codes at SNP positions (≥15% minor allele frequency). Output
+is one directory per region.
 
 ### Interactive Mode
 
@@ -87,37 +89,31 @@ bash scripts/run_te_assembly.sh \
 temp_work/
 └── chr3L_8710861-8744900/
     ├── pipeline.log
-    ├── region.fasta
-    ├── reads.fasta              # Pooled reads from all BAMs
-    ├── assembly/
-    ├── te_contigs.fasta
-    ├── te_seqs.fasta
-    ├── junctions_to_ref.paf
-    ├── junctions_to_te.paf
-    └── junction_*.fasta         # Visual alignments (one per TE insertion)
+    ├── region.fasta             # Reference region sequence
+    ├── reads.fasta              # Pooled junction reads (FASTA)
+    ├── reads_vs_te.tsv          # BLAST: reads vs TE database
+    ├── reads_vs_ref.tsv         # BLAST: reads vs reference region
+    └── junction_*.fasta         # One file per discovered insertion
 ```
 
-### Output Visualization
+### Junction File Format
 
-Each junction file shows a 100bp view of the insertion:
+Each `junction_*.fasta` contains 4 records (100bp each, junction at position 50):
 
 ```
-INSERTION of FBte0000626 at chr3L:8711446
-======================================================================
-  Junction: NODE_21_length_563_cov_4.021654
-    Type: right, transition at junc position 237
-
-    100bp view (insertion at position 50):
-    WT_REF: AGTGCCGAAAGTACAAGTTAAGTACATACATCGTGCCACTATTAACGCTCCACTGACAGCGGCAAAACACGCATCAAAAACACACATACAAATCGGCAGA
-    REF:    --------------------------------------------------CACTGACAGCGGCAAAACACGCATCAAAAACACACATACAAATCGGCAGA
-    JUNC:   GGTCATCATTTCGAATTTCTGCCAAAAAAAACGCATAAAAAACCACTGTGCACTGACAGCGGCAAAACACGCATCAAAAACACACATACAAATCGGCAGA
-    TE:     GTCATCATTTCGAATTTCTGCCAAAAAAAAACACATAAAAAACCACTGTG--------------------------------------------------
+>WT_REF[8711396:8711496] insertion=chr3L:8711446 te=FBte0000626 type=left
+AGTGCCGAAA...reference...AATCGGCAGA    ← Abs allele (pure reference)
+>REF
+AGTGCCGAAA...reference...AATCGGCAGA    ← same (visualization placeholder)
+>reads_consensus_left_0
+GGTCATCWTT...junction...AATCGGCAGA     ← Pre allele with IUPAC SNPs
+>FBte0000626
+GTCATCATTT...te sequence...
 ```
 
-- **WT_REF**: Wild-type reference (continuous, no TE)
-- **REF**: Reference portion aligned to the junction (gap where TE is)
-- **JUNC**: Assembled junction contig spanning the insertion
-- **TE**: Transposable element sequence
+- **WT_REF / REF**: Wild-type reference window (absence allele, Abs)
+- **reads_consensus**: Read-level consensus spanning the junction (presence allele, Pre); IUPAC codes encode SNPs across haplotypes
+- **TE record**: 100bp of TE sequence from the canonical database
 
 ## Building the Competitive Reference
 
@@ -197,13 +193,13 @@ sample2     Abs/Abs   550        50         600    abs_ratio=0.917
 
 ## Pipeline Sections (Phase 1)
 
-1. **Read Extraction**: Pools "gold" reads (region + FBte) and junction candidates (mate unmapped) from all BAMs
-2. **Assembly**: SPAdes assembly of pooled junction-spanning reads
-3. **BLAST**: Identifies contigs with TE similarity
-4. **TE Contig Extraction**: Extracts full sequences of TE-hitting contigs
-5. **TE Sequence Extraction**: Gets canonical TE sequences from database
-6. **Minimap2 Alignment**: Aligns contigs to reference and TE sequences
-7. **Visualization**: Generates visual alignments with `build_te_alignment.py`
+1. **Read Extraction**: Pools junction-candidate reads (mate not on same chromosome) from all BAMs; extracts reference region
+2. **Read-Level Junction Discovery** (`build_junctions_from_reads.py`):
+   - BLAST reads vs TE database and vs reference region
+   - Junction reads = hits to both; infer insertion position from alignment offsets
+   - Cluster reads within ±20bp; skip clusters below `--min-support` (default 3)
+   - Build 100bp consensus anchored at TE boundary; encode IUPAC at SNP positions
+   - Write `junction_{type}_{N}.fasta` per cluster
 
 ## Files
 
@@ -217,7 +213,7 @@ local_TE/
 └── scripts/
     ├── submit_te_analysis.sh            # Phase 1 SLURM wrapper
     ├── run_te_assembly.sh               # Phase 1 main pipeline
-    ├── build_te_alignment.py            # Phase 1 visualization
+    ├── build_junctions_from_reads.py    # Phase 1 read-level junction discovery
     ├── build_junctions_ref.py           # Bridge: build competitive reference
     ├── submit_te_kmer_count.sh          # Phase 2 SLURM orchestrator
     ├── run_te_kmer_count.sh             # Phase 2 BBDuk per-sample
@@ -227,13 +223,12 @@ local_TE/
 
 ## Troubleshooting
 
-**No contigs produced (Phase 1):**
+**No junction files produced (Phase 1):**
 - Check that input BAMs have reads in the specified region
 - Verify the region contains a TE insertion
-
-**No BLAST hits:**
-- The assembled contigs may not span the TE junction
-- Try a different/larger region
+- Inspect `reads_vs_te.tsv` and `reads_vs_ref.tsv` in the output directory;
+  if either is empty, increase the region size or lower the e-value threshold
+- Reduce `--min-support` if coverage is very low (default 3)
 
 **No k-mer matches (Phase 2):**
 - Check that FASTQ files are correct for the samples

@@ -18,6 +18,27 @@ import os
 from Bio import SeqIO
 
 
+# ---------------------------------------------------------------------------
+# IUPAC expansion (for SNP-encoded Pre sequences)
+# ---------------------------------------------------------------------------
+IUPAC = {
+    'R': 'AG', 'Y': 'CT', 'S': 'GC', 'W': 'AT',
+    'K': 'GT', 'M': 'AC', 'B': 'CGT', 'D': 'AGT',
+    'H': 'ACT', 'V': 'ACG', 'N': 'ACGT',
+}
+
+
+def expand_iupac(kmer):
+    """Expand a k-mer containing IUPAC ambiguity codes into all concrete variants."""
+    seqs = ['']
+    for base in kmer.upper():
+        if base in IUPAC:
+            seqs = [s + b for s in seqs for b in IUPAC[base]]
+        else:
+            seqs = [s + base for s in seqs]
+    return seqs
+
+
 def extract_junction_spanning_kmers(abs_seq, pre_seq, junction_pos, k=31, min_flank=10):
     """
     Extract k-mers that span the junction with at least min_flank bases on each side.
@@ -45,7 +66,9 @@ def extract_junction_spanning_kmers(abs_seq, pre_seq, junction_pos, k=31, min_fl
         if len(abs_kmer) == k:
             abs_junction_kmers.add(abs_kmer)
         if len(pre_kmer) == k:
-            pre_junction_kmers.add(pre_kmer)
+            # Expand IUPAC ambiguity codes (SNPs encoded in Pre consensus)
+            for variant in expand_iupac(pre_kmer):
+                pre_junction_kmers.add(variant)
 
     abs_specific = abs_junction_kmers - pre_junction_kmers
     pre_specific = pre_junction_kmers - abs_junction_kmers
