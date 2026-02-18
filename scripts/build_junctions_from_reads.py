@@ -187,6 +187,64 @@ def compute_anchor(jr, cluster_ins_region, read_seqs, min_flank):
     return seq, anchor_0
 
 
+def compute_te_only_anchor(read_id, te_hit, te_junc_coord, canonical_te_strand,
+                            read_seqs, side, min_flank):
+    """
+    Place a TE-only read (no reference BLAST hit) in the junction consensus
+    window by projecting the TE junction coordinate into the read.
+
+    The TE junction coordinate (te_junc_coord) is the position in the TE
+    database that corresponds to the insertion boundary:
+      RIGHT junction → te_send   (end of TE that meets the reference right flank)
+      LEFT  junction → te_sstart (start of TE that meets the reference left flank)
+
+    Coordinate math (symmetric to compute_anchor but using TE alignment):
+      plus  strand: anchor = qstart + (te_junc_coord - sstart)
+      minus strand: anchor = qstart + (sstart - te_junc_coord)
+        (for minus strand BLAST hits sstart > send; the alignment runs
+         from sstart down to send as read position increases)
+
+    The read is then oriented to match the junction reads (same canonical TE
+    strand).  Only the TE side of the anchor is used for the consensus — the
+    post-anchor sequence (reference side) is excluded by build_consensus
+    naturally if the read ends at the anchor.
+
+    Returns (oriented_seq, anchor_0based), or None if the read cannot
+    contribute at least min_flank bases on the TE side of the anchor.
+    """
+    seq = read_seqs.get(read_id)
+    if not seq:
+        return None
+
+    qstart  = te_hit['qstart']
+    sstart  = te_hit['sstart']
+    tstrand = te_hit['sstrand']
+
+    # 1-based anchor in the read
+    if tstrand == 'plus':
+        anchor_1 = qstart + (te_junc_coord - sstart)
+    else:   # minus strand: sstart > te_junc_coord
+        anchor_1 = qstart + (sstart - te_junc_coord)
+
+    anchor_0 = anchor_1 - 1   # 0-based
+
+    # Orient consistently with the junction reads
+    if tstrand != canonical_te_strand:
+        seq      = revcomp(seq)
+        anchor_0 = len(seq) - 1 - anchor_0
+
+    if anchor_0 < 0 or anchor_0 >= len(seq):
+        return None
+
+    # Require min_flank bases on the TE side of the anchor
+    if side == 'right' and anchor_0 < min_flank:
+        return None
+    if side == 'left'  and (len(seq) - anchor_0) < min_flank:
+        return None
+
+    return seq, anchor_0
+
+
 # ---------------------------------------------------------------------------
 # Consensus building
 # ---------------------------------------------------------------------------
@@ -340,6 +398,9 @@ def main():
         junction_reads.append({
             'read_id':    read_id,
             'te_name':    te_h['subject'],
+            'te_sstart':  te_h['sstart'],      # TE alignment start in TE database
+            'te_send':    te_h['send'],         # TE alignment end   in TE database
+            'te_strand':  te_h['sstrand'],
             'ref_qstart': ref_qstart,
             'ref_sstart': ref_h['sstart'],
             'ref_strand': ref_h['sstrand'],
@@ -373,6 +434,21 @@ def main():
 
     if not clusters:
         return
+
+    # ------------------------------------------------------------------
+    # Build TE-only read index
+    # Reads with a TE BLAST hit but no reference hit are the paired mates
+    # that sit entirely within the TE.  They don't cross the junction so
+    # they weren't classified as junction reads, but they do carry sequence
+    # from deeper inside the TE — exactly what fills the N's in the TE half
+    # of the junction consensus.
+    # ------------------------------------------------------------------
+    te_only_by_name = defaultdict(list)   # te_name → [(read_id, te_hit), …]
+    for read_id, te_hit in te_hits.items():
+        if read_id not in ref_hits:
+            te_only_by_name[te_hit['subject']].append((read_id, te_hit))
+    n_te_only_total = sum(len(v) for v in te_only_by_name.values())
+    print(f"  TE-only reads available for TE-half extension: {n_te_only_total}")
 
     # ------------------------------------------------------------------
     # Load sequences
@@ -416,6 +492,56 @@ def main():
 
             if len(anchored) < 2:
                 continue
+
+            n_junc_anchored = len(anchored)
+
+            # ----------------------------------------------------------------
+            # Extend TE half with TE-only reads
+            #
+            # The TE junction coordinate is the position in the TE database
+            # sequence that corresponds to the insertion boundary:
+            #   RIGHT → te_send   (TE's right edge that meets the ref flank)
+            #   LEFT  → te_sstart (TE's left edge that meets the ref flank)
+            #
+            # After compute_anchor potentially RC's a junction read (when
+            # ref_strand==minus), the effective TE strand is flipped.
+            # canonical_te_strand is the TE strand as it appears in the
+            # already-oriented junction reads; TE-only reads are oriented
+            # to match.
+            # ----------------------------------------------------------------
+            te_junc_coords  = []
+            te_strand_votes = []
+            for jr in side_reads:
+                te_junc_coords.append(
+                    jr['te_send'] if side == 'right' else jr['te_sstart'])
+                strand = jr['te_strand']
+                if jr['ref_strand'] == 'minus':
+                    strand = 'minus' if strand == 'plus' else 'plus'
+                te_strand_votes.append(strand)
+
+            te_junc_coord   = sorted(te_junc_coords)[len(te_junc_coords) // 2]
+            canon_te_strand = (
+                'plus' if te_strand_votes.count('plus')
+                          >= te_strand_votes.count('minus') else 'minus')
+
+            n_ext = 0
+            for read_id, te_hit in te_only_by_name.get(te_name, []):
+                te_lo = min(te_hit['sstart'], te_hit['send'])
+                te_hi = max(te_hit['sstart'], te_hit['send'])
+                if not (te_lo <= te_junc_coord <= te_hi):
+                    continue
+                result = compute_te_only_anchor(
+                    read_id, te_hit, te_junc_coord, canon_te_strand,
+                    read_seqs, side, min_flank)
+                if result is not None:
+                    anchored.append(result)
+                    n_ext += 1
+
+            if n_ext:
+                print(f"    extended cluster {cluster_id} {side} with "
+                      f"{n_ext} TE-only reads "
+                      f"({n_junc_anchored} junction + {n_ext} TE-only = "
+                      f"{len(anchored)} total)")
 
             pre_seq = build_consensus(anchored, half=half,
                                       snp_min_freq=snp_min_freq)
