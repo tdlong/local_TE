@@ -454,15 +454,25 @@ def main():
                       f"  ← SNPs>{max_snps}, likely merged clusters")
                 continue
 
+            # Case convention: reference bases lowercase, TE bases UPPERCASE.
+            # The case boundary at position 50 marks the insertion point.
+            abs_out = abs_seq.lower()
+            if side == 'left':
+                # left half = ref flank (lower), right half = TE start (UPPER)
+                pre_out = pre_seq[:half].lower() + pre_seq[half:].upper()
+            else:
+                # left half = TE end (UPPER), right half = ref flank (lower)
+                pre_out = pre_seq[:half].upper() + pre_seq[half:].lower()
+
             with open(out_name, 'w') as fh:
                 fh.write(f">WT_REF[{abs_gstart}:{abs_gend}] "
                          f"insertion={chrom}:{abs_ins_pos} "
                          f"te={te_name} type={side}\n")
-                fh.write(abs_seq + '\n')
-                fh.write(">REF\n" + abs_seq + '\n')
+                fh.write(abs_out + '\n')
+                fh.write(">REF\n" + abs_out + '\n')
                 fh.write(f">reads_consensus_{side}_{cluster_id}\n")
-                fh.write(pre_seq + '\n')
-                fh.write(f">{te_name}\n" + te_sub + '\n')
+                fh.write(pre_out + '\n')
+                fh.write(f">{te_name}\n" + te_sub.upper() + '\n')
 
             print(f"  OK   {os.path.basename(out_name)}  {tag}")
             n_written += 1

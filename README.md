@@ -101,26 +101,30 @@ temp_work/
 Each `junction_{type}_{N}.fasta` contains 4 records, each exactly 100 bp, with the
 insertion point at position 50 (0-indexed).
 
+**Case convention:** reference-derived bases are written **lowercase**; TE-derived
+bases are written **UPPERCASE**. The case boundary in `reads_consensus` marks the
+insertion point exactly — no need to count to position 50.
+
 #### The 4 Records
 
 **Record 1 — WT_REF (absence allele)**
 
 ```
 >WT_REF[8733808:8733907] insertion=chr3L:8733858 te=FBte0000559 type=right
-AAGCGGCGCACACGGGTGGTGGTCTGCTGGGAGACACCCTCCTGCTCGGACAGCTGGCGGCGGTAGATGTTGATCTTGGCAGTGGACTTGTCCAGCGCGT
+aagcggcgcacacgggtggtggtctgctgggagacaccctcctgctcggacagctggcggcggtagatgttgatcttggcagtggacttgtccagcgcgt
 ```
 
 100 bp of the reference genome centered on the insertion site. Position 50 is
 the insertion point. This is what the chromosome looks like with **no TE** — the
-sequence a homozygous wildtype individual would have. The genomic coordinates of
-this window (`[start:end]`), the insertion coordinate, and the TE name are encoded
-in the header.
+sequence a homozygous wildtype individual would have. All lowercase because it is
+entirely reference sequence. The genomic coordinates of this window (`[start:end]`),
+the insertion coordinate, and the TE name are encoded in the header.
 
 **Record 2 — REF (duplicate)**
 
 ```
 >REF
-AAGCGGCGCACACGGGTGGTGGTCTGCTGGGAGACACCCTCCTGCTCGGACAGCTGGCGGCGGTAGATGTTGATCTTGGCAGTGGACTTGTCCAGCGCGT
+aagcggcgcacacgggtggtggtctgctgggagacaccctcctgctcggacagctggcggcggtagatgttgatcttggcagtggacttgtccagcgcgt
 ```
 
 Identical to WT_REF. Included as a second reference track for alignment
@@ -130,28 +134,29 @@ visualization tools (e.g., IGV, MUSCLE). No additional information.
 
 ```
 >reads_consensus_right_8
-NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNCCCTCCTGCTCGGACAGCTGGCGGCGGTAGATGTTGATCTTGGCAGTGGACTTGTCCAGCGCGT
+NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNCCCTCCTGCTCGGacagctggcggcggtagatgttgatcttggcagtggacttgtccagcgcgt
 ```
 
 Consensus built from junction reads — reads that have sequence matching
 **both** the TE database and the reference region. This represents the chromosome
 **with the TE inserted**.
 
-- **Regular bases (A/C/G/T):** Consensus base supported by the majority of reads.
+- **UPPERCASE bases:** TE-derived sequence (positions 0–49 for RIGHT, 50–99 for LEFT).
+- **lowercase bases:** Reference-derived sequence (the shared flanking region).
 - **IUPAC ambiguity codes** (R, Y, W, S, K, M, …): A SNP position where ≥ 2 reads
   carry the minor allele at ≥ 15% frequency. These capture multiple TE-bearing
-  haplotypes in a pooled population sample. Phase 2 expands each IUPAC k-mer into
-  all concrete variants so every haplotype is counted.
-- **N (capital N):** No read coverage at that position. This almost always occurs
-  in the TE half because short reads don't extend far past the junction into the TE.
-  The `TE_cov` metric in the run log counts non-N bases in the TE half; higher is
-  better (more diagnostic k-mers available for Phase 2).
+  haplotypes in a pooled population sample. IUPAC codes follow the same case rule
+  as the bases around them. Phase 2 expands each IUPAC k-mer into all concrete
+  variants so every haplotype is counted.
+- **N (uppercase, in TE half):** No read coverage at that position — reads don't
+  extend that far into the TE. The `TE_cov` metric in the run log counts non-N
+  bases in the TE half; higher is better (more diagnostic k-mers for Phase 2).
 
 **Record 4 — TE canonical sequence**
 
 ```
 >FBte0000559
-CGAGCGGAAAGACAGCAATTTTGGCCGTCACCAAAAAAGTGGCTGCATAGTGCCAAACCAATGTATGGCCGTTACGCATCTTGTTATTCTAGTGTCTTTG
+CGAGCGGAAAGACAGCAATTTTGGCCGTCACCAAAAAAGTGGCTGCATAGTGCCAAACCAATGTATGGCCGTTACGCATCTTGTTATTCTAGTGTCTTTG  (all uppercase)
 ```
 
 100 bp of the canonical TE sequence from the TE database. Compare the non-N bases
