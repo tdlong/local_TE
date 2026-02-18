@@ -93,11 +93,14 @@ def main():
         abs_seq = str(wt_ref_rec.seq).replace('-', '')
         pre_seq = str(junc_rec.seq).replace('-', '')
 
-        # Dedup key: insertion position + TE name
-        key = (insertion, te_name)
+        # Dedup key: insertion position + TE name + junction type
+        # Include type so left and right junctions at the same insertion
+        # both get their own entry (they span different TE ends and produce
+        # different diagnostic k-mers for Phase 2).
+        key = (insertion, te_name, jtype)
 
         if key in junctions:
-            print(f"  Duplicate: {insertion} {te_name} (keeping first)")
+            print(f"  Duplicate: {insertion} {te_name} ({jtype}) (keeping first)")
             continue
 
         junctions[key] = {
@@ -122,10 +125,10 @@ def main():
     with open(output_fa, 'w') as fa, open(output_tsv, 'w') as tsv:
         tsv.write("junction_id\tinsertion\tte_name\ttype\tcontig\tsource_dir\tabs_len\tpre_len\n")
 
-        for (insertion, te_name), data in sorted(junctions.items()):
-            # Create a safe ID: chr3L:8711446 -> chr3L_8711446
+        for (insertion, te_name, jtype), data in sorted(junctions.items()):
+            # Create a safe ID: chr3L:8711446 + type -> chr3L_8711446_right
             safe_insertion = insertion.replace(':', '_')
-            junction_id = f"{safe_insertion}_{te_name}"
+            junction_id = f"{safe_insertion}_{te_name}_{jtype}"
 
             fa.write(f">{junction_id}_Abs\n{data['abs_seq']}\n")
             fa.write(f">{junction_id}_Pre\n{data['pre_seq']}\n")
