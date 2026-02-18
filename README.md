@@ -98,22 +98,117 @@ temp_work/
 
 ### Junction File Format
 
-Each `junction_*.fasta` contains 4 records (100bp each, junction at position 50):
+Each `junction_{type}_{N}.fasta` contains 4 records, each exactly 100 bp, with the
+insertion point at position 50 (0-indexed).
+
+#### The 4 Records
+
+**Record 1 — WT_REF (absence allele)**
 
 ```
->WT_REF[8711396:8711496] insertion=chr3L:8711446 te=FBte0000626 type=left
-AGTGCCGAAA...reference...AATCGGCAGA    ← Abs allele (pure reference)
+>WT_REF[8733808:8733907] insertion=chr3L:8733858 te=FBte0000559 type=right
+AAGCGGCGCACACGGGTGGTGGTCTGCTGGGAGACACCCTCCTGCTCGGACAGCTGGCGGCGGTAGATGTTGATCTTGGCAGTGGACTTGTCCAGCGCGT
+```
+
+100 bp of the reference genome centered on the insertion site. Position 50 is
+the insertion point. This is what the chromosome looks like with **no TE** — the
+sequence a homozygous wildtype individual would have. The genomic coordinates of
+this window (`[start:end]`), the insertion coordinate, and the TE name are encoded
+in the header.
+
+**Record 2 — REF (duplicate)**
+
+```
 >REF
-AGTGCCGAAA...reference...AATCGGCAGA    ← same (visualization placeholder)
->reads_consensus_left_0
-GGTCATCWTT...junction...AATCGGCAGA     ← Pre allele with IUPAC SNPs
->FBte0000626
-GTCATCATTT...te sequence...
+AAGCGGCGCACACGGGTGGTGGTCTGCTGGGAGACACCCTCCTGCTCGGACAGCTGGCGGCGGTAGATGTTGATCTTGGCAGTGGACTTGTCCAGCGCGT
 ```
 
-- **WT_REF / REF**: Wild-type reference window (absence allele, Abs)
-- **reads_consensus**: Read-level consensus spanning the junction (presence allele, Pre); IUPAC codes encode SNPs across haplotypes
-- **TE record**: 100bp of TE sequence from the canonical database
+Identical to WT_REF. Included as a second reference track for alignment
+visualization tools (e.g., IGV, MUSCLE). No additional information.
+
+**Record 3 — reads_consensus (presence allele)**
+
+```
+>reads_consensus_right_8
+NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNCCCTCCTGCTCGGACAGCTGGCGGCGGTAGATGTTGATCTTGGCAGTGGACTTGTCCAGCGCGT
+```
+
+Consensus built from junction reads — reads that have sequence matching
+**both** the TE database and the reference region. This represents the chromosome
+**with the TE inserted**.
+
+- **Regular bases (A/C/G/T):** Consensus base supported by the majority of reads.
+- **IUPAC ambiguity codes** (R, Y, W, S, K, M, …): A SNP position where ≥ 2 reads
+  carry the minor allele at ≥ 15% frequency. These capture multiple TE-bearing
+  haplotypes in a pooled population sample. Phase 2 expands each IUPAC k-mer into
+  all concrete variants so every haplotype is counted.
+- **N (capital N):** No read coverage at that position. This almost always occurs
+  in the TE half because short reads don't extend far past the junction into the TE.
+  The `TE_cov` metric in the run log counts non-N bases in the TE half; higher is
+  better (more diagnostic k-mers available for Phase 2).
+
+**Record 4 — TE canonical sequence**
+
+```
+>FBte0000559
+CGAGCGGAAAGACAGCAATTTTGGCCGTCACCAAAAAAGTGGCTGCATAGTGCCAAACCAATGTATGGCCGTTACGCATCTTGTTATTCTAGTGTCTTTG
+```
+
+100 bp of the canonical TE sequence from the TE database. Compare the non-N bases
+in the TE half of reads_consensus against this record to confirm TE identity and
+orientation. For a RIGHT junction this is the **end** of the TE; for a LEFT junction
+this is the **start** of the TE.
+
+---
+
+#### LEFT vs. RIGHT Junction Types
+
+The type tells you which end of the TE is captured and which side of the
+junction is the reference flank:
+
+```
+RIGHT junction (type=right):
+  Read layout:   [--- TE end (50 bp) ---][--- ref right flank (50 bp) ---]
+  Position:       0                     50                              99
+  reads_consensus: TE bases → N (no cov)  |  matches WT_REF from pos 50
+  WT_REF:          ref left flank         |  ref right flank
+
+LEFT junction (type=left):
+  Read layout:   [--- ref left flank (50 bp) ---][--- TE start (50 bp) ---]
+  Position:       0                             50                        99
+  reads_consensus: matches WT_REF to pos 50     |  TE bases → N (no cov)
+  WT_REF:          ref left flank               |  ref right flank
+```
+
+For a complete insertion you typically get **both** a left and a right junction
+file — one for each side of the TE. Each independently confirms the same insertion
+position and TE identity.
+
+---
+
+#### How to Read a Spot-check
+
+Using the right-junction example above (`insertion=chr3L:8733858, te=FBte0000559`):
+
+1. **Confirm WT_REF makes sense:** The window header says `[8733808:8733907]` —
+   that is 100 bp centered on position 8733858 (position 50 = 8733808 + 50). ✓
+
+2. **Check the TE half of reads_consensus (positions 0–49):** The first 36 positions
+   are N (reads don't reach that far into the TE). Positions 36–49 have 14 bp of
+   actual TE sequence (`TE_cov=14/50`). Compare those 14 bp against the FBte0000559
+   record — they should match the **end** of that TE sequence.
+
+3. **Check the ref half of reads_consensus (positions 50–99):** These should match
+   WT_REF from position 50 onward. In the example they are identical. ✓
+
+4. **IUPAC codes:** `SNPs=0` here means every read agreed at every covered position.
+   A few IUPAC codes (1–4) is normal in a diverse population. Many codes (> 10,
+   flagged as SKIP by the pipeline) suggests two different nearby insertions were
+   accidentally merged into one cluster.
+
+5. **Low TE_cov (< 20/50):** These junctions are real but will produce fewer Phase 2
+   k-mers. Genotyping accuracy may be lower; treat genotype calls for these junctions
+   with caution.
 
 ## Building the Competitive Reference
 
