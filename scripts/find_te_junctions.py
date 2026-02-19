@@ -95,13 +95,19 @@ def read_fastq_seqs(path):
 # Step 4a: Parse FASTG
 # ---------------------------------------------------------------------------
 def parse_fastg(path):
-    """Extract node sequences from SPAdes FASTG file.
+    """Extract node sequences and edge connectivity from SPAdes FASTG.
 
     FASTG header format:
-      >EDGE_1_length_1000_cov_50.5:EDGE_2',...;
-    We strip edge info after ':' and the trailing ';'.
+      >EDGE_1_length_1000_cov_50.5:EDGE_2',EDGE_3;
+    After ':' is the successor list; node's END connects to each
+    successor's START.
+
+    Returns:
+        nodes: {name: sequence}
+        edges: {name: [successor_names]}
     """
     nodes = {}
+    edges = {}
     current_name = None
     current_seq = []
     with open(path) as f:
@@ -110,15 +116,31 @@ def parse_fastg(path):
             if line.startswith('>'):
                 if current_name:
                     nodes[current_name] = ''.join(current_seq)
-                # Strip edge info: ">EDGE_1_length_1000_cov_50.5:EDGE_2,...;"
-                name = line[1:].split(':')[0].rstrip(';').strip()
+                header = line[1:]
+                if ':' in header:
+                    name_part, rest = header.split(':', 1)
+                    name = name_part.rstrip(';').strip()
+                    rest = rest.rstrip(';').strip()
+                    succs = [s.strip() for s in rest.split(',') if s.strip()]
+                    edges[name] = succs
+                else:
+                    name = header.rstrip(';').strip()
+                    edges[name] = []
                 current_name = name
                 current_seq = []
             else:
                 current_seq.append(line.strip())
     if current_name:
         nodes[current_name] = ''.join(current_seq)
-    return nodes
+    return nodes, edges
+
+
+def find_node_overlap(seq_a, seq_b, min_ov=10, max_ov=60):
+    """Find overlap: longest suffix of seq_a matching prefix of seq_b."""
+    for ov in range(min(max_ov, len(seq_a), len(seq_b)), min_ov - 1, -1):
+        if seq_a[-ov:].upper() == seq_b[:ov].upper():
+            return ov
+    return 0
 
 
 def write_nodes_fasta(nodes, out_path):
@@ -459,8 +481,9 @@ def main():
     # Step 4a: Parse graph nodes
     # ------------------------------------------------------------------
     print("Step 4a: Parsing assembly graph")
-    nodes = parse_fastg(graph_path)
-    print(f"  {len(nodes)} graph nodes extracted")
+    nodes, graph_edges = parse_fastg(graph_path)
+    print(f"  {len(nodes)} graph nodes extracted, "
+          f"{sum(len(v) for v in graph_edges.values())} edges")
 
     if not nodes:
         print("  ERROR: No nodes in assembly graph")
@@ -682,6 +705,92 @@ def main():
                 'genomic_pos': genomic_pos,
                 'junction_seq': junc_100,
             })
+
+    # --- Graph edge approach: find TE nodes adjacent to ref nodes ---
+    # SPAdes encodes branch points as graph edges. If a TE node connects
+    # to a reference node, the junction is at the connection point.  This
+    # works even when k-mer walking fails (e.g., due to error-corrected
+    # reads not matching the original FASTQ k-mers).
+    predecessors = defaultdict(list)
+    for node_name, succs in graph_edges.items():
+        for succ in succs:
+            predecessors[succ].append(node_name)
+
+    n_graph_found = 0
+    for info in te_walk_nodes:
+        te_node = info['node_id']
+        te_name = info['te_hit']['sseqid']
+        te_seq = nodes[te_node]
+
+        neighbors = []
+        # Successors: TE node's END connects to neighbor's START
+        for succ in graph_edges.get(te_node, []):
+            if succ in nodes:
+                neighbors.append(('successor', succ))
+        # Predecessors: neighbor's END connects to TE node's START
+        for pred in predecessors.get(te_node, []):
+            if pred in nodes:
+                neighbors.append(('predecessor', pred))
+
+        for direction, neighbor in neighbors:
+            nb_seq = nodes[neighbor]
+
+            if direction == 'successor':
+                overlap = find_node_overlap(te_seq, nb_seq)
+                concat = te_seq + nb_seq[overlap:]
+            else:
+                overlap = find_node_overlap(nb_seq, te_seq)
+                concat = nb_seq + te_seq[overlap:]
+
+            # BLAST concatenated sequence vs reference
+            ref_hit = blast_seq_vs_ref(
+                concat, region_fa, outdir,
+                f"edge_{te_node}_{direction}_{neighbor}")
+            if ref_hit is None:
+                continue
+
+            # Find junction: where does ref begin/end in the concat?
+            if direction == 'successor':
+                # Concat: [...TE...][...neighbor...], ref in neighbor portion
+                junc_pos = ref_hit['qstart'] - 1  # 0-based: where ref begins
+                candidate_type = 'right'  # TE left, ref right
+            else:
+                # Concat: [...neighbor...][...TE...], ref in neighbor portion
+                junc_pos = ref_hit['qend']  # 0-based: where TE begins
+                candidate_type = 'left'  # ref left, TE right
+
+            junc_100 = extract_junction_100bp(
+                concat, junc_pos, candidate_type, half)
+            if junc_100 is None:
+                continue
+
+            # Orient via ref BLAST strand
+            if ref_hit['sstrand'] == 'minus':
+                junc_100 = revcomp(junc_100)
+                candidate_type = 'left' if candidate_type == 'right' else 'right'
+
+            if candidate_type == 'right':
+                ins_region = min(ref_hit['sstart'], ref_hit['send'])
+            else:
+                ins_region = max(ref_hit['sstart'], ref_hit['send'])
+            genomic_pos = region_start + ins_region - 1
+
+            print(f"  {te_node}→{neighbor}: graph edge junction "
+                  f"{candidate_type} at {chrom}:{genomic_pos}")
+            junction_candidates.append({
+                'node_id': te_node,
+                'source': 'graph_edge',
+                'side': candidate_type,
+                'te_name': te_name,
+                'te_hit': info['te_hit'],
+                'ins_region': ins_region,
+                'genomic_pos': genomic_pos,
+                'junction_seq': junc_100,
+            })
+            n_graph_found += 1
+
+    if n_graph_found:
+        print(f"  Graph edges: {n_graph_found} new junctions found")
 
     print(f"\n  Total junction candidates: {len(junction_candidates)}")
 
