@@ -598,9 +598,10 @@ def main():
         })
 
     # --- Walk ALL TE-containing nodes (boundary + interior) ---
-    # Try walking from BOTH ends of each node. The wrong direction will
-    # either fail to extend or won't BLAST to the reference, so it
-    # naturally filters. With only ~12 TE nodes the cost is trivial.
+    # Try walking from BOTH ends of each node. BLAST the full walked
+    # sequence vs reference to find where ref begins/ends — this correctly
+    # locates the junction even for interior nodes where the seed boundary
+    # is deep inside the TE (not at the TE/ref junction).
     te_walk_nodes = by_class['te_boundary'] + by_class['te_interior']
     print(f"\n  Attempting k-mer walks from {len(te_walk_nodes)} TE nodes "
           f"({len(by_class['te_boundary'])} boundary + "
@@ -617,52 +618,55 @@ def main():
                 walked, n_iupac = kmer_walk_right(
                     seed, kmer_index, walk_len, k, args.min_vote_frac)
                 extension_len = len(walked) - len(seed)
-
-                if extension_len < 30:
-                    continue
-
-                # In the walked sequence: TE (seed) on left, extension on right
-                junc_pos = len(seed)
-                candidate_type = 'right'  # tentative: TE left, ref right
-
             else:
                 seed = node_seq[:min(len(node_seq), 200)]
                 walked, n_iupac = kmer_walk_left(
                     seed, kmer_index, walk_len, k, args.min_vote_frac)
                 extension_len = len(walked) - len(seed)
 
-                if extension_len < 30:
-                    continue
-
-                # In the walked sequence: extension on left, TE (seed) on right
-                junc_pos = extension_len
-                candidate_type = 'left'  # tentative: ref left, TE right
-
-            junc_100 = extract_junction_100bp(walked, junc_pos, candidate_type, half)
-            if junc_100 is None:
+            if extension_len < 10:
                 continue
 
-            # BLAST the ref half to verify it hits the reference
-            if candidate_type == 'right':
-                ref_half = junc_100[half:]
+            # BLAST the FULL walked sequence vs reference to find
+            # the true junction point (not just the seed boundary).
+            # For interior nodes the walk traverses TE then ref, so
+            # the junction is inside the walked sequence.
+            ref_hit_walk = blast_seq_vs_ref(
+                walked, region_fa, outdir, f"walk_{node_id}_{walk_dir}")
+            if ref_hit_walk is None:
+                print(f"    {node_id} walk_{walk_dir}: {extension_len}bp "
+                      f"extended but no ref BLAST hit")
+                continue
+
+            # Find junction point from where ref maps in the walked seq.
+            # BLAST qstart/qend are 1-based positions in the walked sequence.
+            if walk_dir == 'right':
+                # Walked: [seed (TE)] [extension (TE→ref)]
+                # Ref starts at qstart in walked sequence
+                junc_pos = ref_hit_walk['qstart'] - 1  # 0-based
+                candidate_type = 'right'  # TE left, ref right
             else:
-                ref_half = junc_100[:half]
+                # Walked: [extension (ref→TE)] [seed (TE)]
+                # Ref ends at qend in walked sequence
+                junc_pos = ref_hit_walk['qend']  # 0-based: where TE begins
+                candidate_type = 'left'  # ref left, TE right
 
-            ref_hit_loc = blast_seq_vs_ref(ref_half, region_fa, outdir,
-                                            f"walk_{node_id}_{walk_dir}")
-            if ref_hit_loc is None:
-                continue  # wrong direction — extension isn't reference
+            junc_100 = extract_junction_100bp(
+                walked, junc_pos, candidate_type, half)
+            if junc_100 is None:
+                print(f"    {node_id} walk_{walk_dir}: junction at pos "
+                      f"{junc_pos} too close to end (walked {len(walked)}bp)")
+                continue
 
-            # Fix orientation: if ref BLASTs minus, the walked sequence
-            # is RC relative to the genome. RC and flip type.
-            if ref_hit_loc['sstrand'] == 'minus':
+            # Orient: if ref BLASTs minus strand, walked is RC relative to genome
+            if ref_hit_walk['sstrand'] == 'minus':
                 junc_100 = revcomp(junc_100)
                 candidate_type = 'left' if candidate_type == 'right' else 'right'
 
             if candidate_type == 'right':
-                ins_region = min(ref_hit_loc['sstart'], ref_hit_loc['send'])
+                ins_region = min(ref_hit_walk['sstart'], ref_hit_walk['send'])
             else:
-                ins_region = max(ref_hit_loc['sstart'], ref_hit_loc['send'])
+                ins_region = max(ref_hit_walk['sstart'], ref_hit_walk['send'])
             genomic_pos = region_start + ins_region - 1
 
             print(f"  {node_id} walk_{walk_dir}: walked {extension_len}bp, "
