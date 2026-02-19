@@ -508,8 +508,10 @@ def main():
           f"{len(by_class['te_interior'])} TE-interior, "
           f"{len(by_class['ref_only'])} ref-only")
 
-    if not by_class['junction'] and not by_class['te_boundary']:
-        print("  No junction or TE-boundary nodes found — cannot discover junctions")
+    te_nodes_total = (len(by_class['junction']) + len(by_class['te_boundary'])
+                      + len(by_class['te_interior']))
+    if te_nodes_total == 0:
+        print("  No TE-containing nodes found — cannot discover junctions")
         return
 
     # ------------------------------------------------------------------
@@ -566,22 +568,9 @@ def main():
             print(f"  {node_id}: junction too close to node boundary — skipped")
             continue
 
-        # Determine ref half for BLAST (based on node layout)
-        if te_is_left_in_node:
-            ref_half = junc_100[half:]   # right half is ref in node
-        else:
-            ref_half = junc_100[:half]   # left half is ref in node
-
-        ref_hit_loc = blast_seq_vs_ref(ref_half, region_fa, outdir,
-                                        f"junc_{node_id}")
-        if ref_hit_loc is None:
-            print(f"  {node_id}: ref half doesn't BLAST to region — skipped")
-            continue
-
-        # Fix orientation: if ref half BLASTs minus strand, the node
-        # (and our extracted junction) is RC relative to the genome.
-        # RC the junction and swap which half is TE vs ref.
-        if ref_hit_loc['sstrand'] == 'minus':
+        # Use node-level ref BLAST for orientation (no re-BLAST needed).
+        # If ref portion maps to minus strand, node is RC relative to genome.
+        if ref_hit['sstrand'] == 'minus':
             junc_100 = revcomp(junc_100)
             te_is_left_in_node = not te_is_left_in_node
 
@@ -590,10 +579,10 @@ def main():
         # LEFT:  [ref left flank (0-49) | TE start (50-99)]
         if te_is_left_in_node:
             side = 'right'
-            ins_region = min(ref_hit_loc['sstart'], ref_hit_loc['send'])
+            ins_region = min(ref_hit['sstart'], ref_hit['send'])
         else:
             side = 'left'
-            ins_region = max(ref_hit_loc['sstart'], ref_hit_loc['send'])
+            ins_region = max(ref_hit['sstart'], ref_hit['send'])
 
         genomic_pos = region_start + ins_region - 1
 
@@ -608,12 +597,15 @@ def main():
             'junction_seq': junc_100,
         })
 
-    # --- Process TE-BOUNDARY nodes (need k-mer walk) ---
+    # --- Walk ALL TE-containing nodes (boundary + interior) ---
     # Try walking from BOTH ends of each node. The wrong direction will
     # either fail to extend or won't BLAST to the reference, so it
-    # naturally filters. This avoids needing to guess the walk direction
-    # from TE strand, which was buggy.
-    for info in by_class['te_boundary']:
+    # naturally filters. With only ~12 TE nodes the cost is trivial.
+    te_walk_nodes = by_class['te_boundary'] + by_class['te_interior']
+    print(f"\n  Attempting k-mer walks from {len(te_walk_nodes)} TE nodes "
+          f"({len(by_class['te_boundary'])} boundary + "
+          f"{len(by_class['te_interior'])} interior)")
+    for info in te_walk_nodes:
         node_id = info['node_id']
         node_seq = nodes[node_id]
         te_hit = info['te_hit']
