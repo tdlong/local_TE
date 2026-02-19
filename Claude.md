@@ -4,7 +4,7 @@ Two-phase pipeline: discover TE insertions from BAMs, then genotype them across 
 
 ## Phases
 
-**Phase 1 (Discovery):** Pool reads from BAMs per region, assemble with SPAdes (metagenome mode), parse the assembly graph for TE-containing nodes, k-mer walk from TE boundaries into reference sequence, cross-validate against a gold standard catalog built from BAM mate-pair info, and write `junction_*.fasta` files → `junctions.fa`.
+**Phase 1 (Discovery):** Pool reads from BAMs per region, assemble with SPAdes (metagenome mode), parse the assembly graph for TE-containing nodes, extract junctions via three methods (junction nodes, k-mer walk, graph edge tracing), cross-validate against gold standard, write `junction_*.fasta` files → `junctions.fa`.
 
 **Phase 2 (Genotyping):** Extract diagnostic k-mers from junction sequences, scan raw FASTQs with BBDuk, call genotypes from k-mer counts.
 
@@ -37,7 +37,10 @@ cd /dfs7/adl/tdlong/Sarah/local_TE
 # 2. Phase 1: Discover TE insertions
 sbatch scripts/submit_te_analysis.sh
 
-# 3. Phase 2: Genotype via k-mer counting
+# 3. Build competitive reference
+python scripts/build_junctions_ref.py temp_work junctions.fa
+
+# 4. Phase 2: Genotype via k-mer counting
 sbatch scripts/submit_te_kmer_count.sh
 ```
 
@@ -46,13 +49,15 @@ sbatch scripts/submit_te_kmer_count.sh
 ```
 local_TE/
 ├── config.sh                            # BAMs, regions, FASTQs, refs
-├── junctions.fa                         # Built by Phase 1
+├── junctions.fa                         # Built by build_junctions_ref.py
 ├── junctions_metadata.tsv
 └── scripts/
     ├── submit_te_analysis.sh            # Phase 1 SLURM wrapper
-    ├── run_te_assembly.sh               # Phase 1 pipeline (SPAdes + k-mer walk)
-    ├── find_te_junctions.py             # Phase 1 graph + k-mer walk junction discovery
+    ├── run_te_assembly.sh               # Phase 1 pipeline (SPAdes + junction finding)
+    ├── find_te_junctions.py             # Phase 1 junction discovery
     ├── build_junctions_ref.py           # Build competitive reference
+    ├── test_phase1.sh                   # Interactive Phase 1 test
+    ├── summarize_phase1.sh              # Diagnostic summary
     ├── submit_te_kmer_count.sh          # Phase 2 SLURM orchestrator
     ├── run_te_kmer_count.sh             # Phase 2 BBDuk per-sample
     ├── extract_junction_kmers.py        # Phase 2 k-mer extraction
