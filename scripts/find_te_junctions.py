@@ -174,8 +174,13 @@ def get_best_hits_per_query(hits):
     return dict(by_query)
 
 
-def classify_nodes(te_hits_by_node, ref_hits_by_node, te_lengths):
+def classify_nodes(te_hits_by_node, ref_hits_by_node, te_lengths,
+                    min_ref_len=50):
     """Classify each node as junction, te_boundary, te_interior, or ref_only.
+
+    A node needs both a TE hit and a substantial ref hit (>=min_ref_len bp)
+    to be classified as junction.  A weak/spurious ref hit is ignored so
+    TE-boundary nodes aren't misclassified.
 
     Returns list of dicts with classification and relevant hit info.
     """
@@ -186,13 +191,16 @@ def classify_nodes(te_hits_by_node, ref_hits_by_node, te_lengths):
         te_hits = te_hits_by_node.get(node_id, [])
         ref_hits = ref_hits_by_node.get(node_id, [])
 
-        if te_hits and ref_hits:
-            # Junction node: hits both TE and reference
+        # Only count substantial ref hits
+        good_ref = [h for h in ref_hits if h['length'] >= min_ref_len]
+
+        if te_hits and good_ref:
+            # Junction node: both TE and substantial reference
             classified.append({
                 'node_id': node_id,
                 'class': 'junction',
                 'te_hit': te_hits[0],
-                'ref_hit': ref_hits[0],
+                'ref_hit': good_ref[0],
             })
         elif te_hits:
             best = te_hits[0]
@@ -539,49 +547,55 @@ def main():
         ref_hit = info['ref_hit']
         te_name = te_hit['sseqid']
 
-        # Determine junction type from relative positions of TE and ref
-        # in the node sequence
+        # Determine which half of the node is TE vs ref (in node coordinates)
         te_mid = (te_hit['qstart'] + te_hit['qend']) / 2
         ref_mid = (ref_hit['qstart'] + ref_hit['qend']) / 2
+        te_is_left_in_node = te_mid < ref_mid
 
-        if te_mid < ref_mid:
-            # TE is on the left, reference on the right → RIGHT junction
-            side = 'right'
-            # Junction point is where TE hit ends
+        # Junction point: where TE and ref portions meet in the node
+        if te_is_left_in_node:
             junc_pos = te_hit['qend']
+            extract_side = 'right'  # TE left, ref right
         else:
-            # Reference on the left, TE on the right → LEFT junction
-            side = 'left'
-            # Junction point is where TE hit starts
             junc_pos = te_hit['qstart']
+            extract_side = 'left'   # ref left, TE right
 
-        # Get genomic position from reference hit
-        ref_sstart = min(ref_hit['sstart'], ref_hit['send'])
-
-        # Extract 100bp junction
-        junc_100 = extract_junction_100bp(node_seq, junc_pos, side, half)
+        # Extract 100bp around junction point (orientation not yet determined)
+        junc_100 = extract_junction_100bp(node_seq, junc_pos, extract_side, half)
         if junc_100 is None:
             print(f"  {node_id}: junction too close to node boundary — skipped")
             continue
 
-        # BLAST the ref half to get precise genomic coordinates
-        if side == 'right':
-            ref_half = junc_100[half:]  # right half is reference
+        # Determine ref half for BLAST (based on node layout)
+        if te_is_left_in_node:
+            ref_half = junc_100[half:]   # right half is ref in node
         else:
-            ref_half = junc_100[:half]  # left half is reference
+            ref_half = junc_100[:half]   # left half is ref in node
 
         ref_hit_loc = blast_seq_vs_ref(ref_half, region_fa, outdir,
-                                        f"junc_{node_id}_{side}")
-        if ref_hit_loc:
-            if side == 'right':
-                ins_region = min(ref_hit_loc['sstart'], ref_hit_loc['send'])
-            else:
-                ins_region = max(ref_hit_loc['sstart'], ref_hit_loc['send'])
-            genomic_pos = region_start + ins_region - 1
+                                        f"junc_{node_id}")
+        if ref_hit_loc is None:
+            print(f"  {node_id}: ref half doesn't BLAST to region — skipped")
+            continue
+
+        # Fix orientation: if ref half BLASTs minus strand, the node
+        # (and our extracted junction) is RC relative to the genome.
+        # RC the junction and swap which half is TE vs ref.
+        if ref_hit_loc['sstrand'] == 'minus':
+            junc_100 = revcomp(junc_100)
+            te_is_left_in_node = not te_is_left_in_node
+
+        # Determine L/R from which half is TE (in the now-oriented junction)
+        # RIGHT: [TE end (0-49) | ref right flank (50-99)]
+        # LEFT:  [ref left flank (0-49) | TE start (50-99)]
+        if te_is_left_in_node:
+            side = 'right'
+            ins_region = min(ref_hit_loc['sstart'], ref_hit_loc['send'])
         else:
-            # Fallback: use ref hit position from the original node BLAST
-            ins_region = ref_sstart
-            genomic_pos = region_start + ins_region - 1
+            side = 'left'
+            ins_region = max(ref_hit_loc['sstart'], ref_hit_loc['send'])
+
+        genomic_pos = region_start + ins_region - 1
 
         junction_candidates.append({
             'node_id': node_id,
@@ -595,84 +609,77 @@ def main():
         })
 
     # --- Process TE-BOUNDARY nodes (need k-mer walk) ---
+    # Try walking from BOTH ends of each node. The wrong direction will
+    # either fail to extend or won't BLAST to the reference, so it
+    # naturally filters. This avoids needing to guess the walk direction
+    # from TE strand, which was buggy.
     for info in by_class['te_boundary']:
         node_id = info['node_id']
         node_seq = nodes[node_id]
         te_hit = info['te_hit']
         te_name = te_hit['sseqid']
 
-        # Determine which end of the TE we're near and the walk direction
-        # near_start: TE hit is near the start of the TE → LEFT junction
-        #   (we need to walk LEFT from the node into reference)
-        # near_end: TE hit is near the end of the TE → RIGHT junction
-        #   (we need to walk RIGHT from the node into reference)
-        sides_to_try = []
-        if info['near_end']:
-            sides_to_try.append('right')
-        if info['near_start']:
-            sides_to_try.append('left')
-
-        for side in sides_to_try:
-            if side == 'right':
-                # TE end → need reference on the right
-                # Seed = end of node sequence
+        for walk_dir in ['right', 'left']:
+            if walk_dir == 'right':
                 seed = node_seq[-min(len(node_seq), 200):]
                 walked, n_iupac = kmer_walk_right(
                     seed, kmer_index, walk_len, k, args.min_vote_frac)
                 extension_len = len(walked) - len(seed)
 
                 if extension_len < 30:
-                    print(f"  {node_id} {side}: walk extended only {extension_len}bp — skipped")
                     continue
 
-                # Junction point is where seed ends (= where extension begins)
+                # In the walked sequence: TE (seed) on left, extension on right
                 junc_pos = len(seed)
-                junc_100 = extract_junction_100bp(walked, junc_pos, side, half)
+                candidate_type = 'right'  # tentative: TE left, ref right
 
             else:
-                # TE start → need reference on the left
-                # Seed = start of node sequence
                 seed = node_seq[:min(len(node_seq), 200)]
                 walked, n_iupac = kmer_walk_left(
                     seed, kmer_index, walk_len, k, args.min_vote_frac)
                 extension_len = len(walked) - len(seed)
 
                 if extension_len < 30:
-                    print(f"  {node_id} {side}: walk extended only {extension_len}bp — skipped")
                     continue
 
-                # Junction point is where extension ends (= where seed starts)
+                # In the walked sequence: extension on left, TE (seed) on right
                 junc_pos = extension_len
-                junc_100 = extract_junction_100bp(walked, junc_pos, side, half)
+                candidate_type = 'left'  # tentative: ref left, TE right
 
+            junc_100 = extract_junction_100bp(walked, junc_pos, candidate_type, half)
             if junc_100 is None:
-                print(f"  {node_id} {side}: couldn't extract 100bp junction — skipped")
                 continue
 
-            print(f"  {node_id} {side}: walked {extension_len}bp into reference")
-
-            # BLAST the ref half to get genomic coordinates
-            if side == 'right':
+            # BLAST the ref half to verify it hits the reference
+            if candidate_type == 'right':
                 ref_half = junc_100[half:]
             else:
                 ref_half = junc_100[:half]
 
             ref_hit_loc = blast_seq_vs_ref(ref_half, region_fa, outdir,
-                                            f"walk_{node_id}_{side}")
-            if ref_hit_loc:
-                if side == 'right':
-                    ins_region = min(ref_hit_loc['sstart'], ref_hit_loc['send'])
-                else:
-                    ins_region = max(ref_hit_loc['sstart'], ref_hit_loc['send'])
-                genomic_pos = region_start + ins_region - 1
+                                            f"walk_{node_id}_{walk_dir}")
+            if ref_hit_loc is None:
+                continue  # wrong direction — extension isn't reference
+
+            # Fix orientation: if ref BLASTs minus, the walked sequence
+            # is RC relative to the genome. RC and flip type.
+            if ref_hit_loc['sstrand'] == 'minus':
+                junc_100 = revcomp(junc_100)
+                candidate_type = 'left' if candidate_type == 'right' else 'right'
+
+            if candidate_type == 'right':
+                ins_region = min(ref_hit_loc['sstart'], ref_hit_loc['send'])
             else:
-                print(f"  {node_id} {side}: ref half doesn't BLAST to region — skipped")
-                continue
+                ins_region = max(ref_hit_loc['sstart'], ref_hit_loc['send'])
+            genomic_pos = region_start + ins_region - 1
+
+            print(f"  {node_id} walk_{walk_dir}: walked {extension_len}bp, "
+                  f"junction {candidate_type} at {chrom}:{genomic_pos}")
 
             junction_candidates.append({
                 'node_id': node_id,
                 'source': 'kmer_walk',
-                'side': side,
+                'side': candidate_type,
                 'te_name': te_name,
                 'te_hit': te_hit,
                 'ins_region': ins_region,
