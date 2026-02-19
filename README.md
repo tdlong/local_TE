@@ -4,7 +4,7 @@ A two-phase pipeline for detecting transposable element (TE) insertions from pai
 
 ## Overview
 
-**Phase 1 (Discovery):** Pool reads from all BAMs for each genomic region, BLAST individual reads against the TE database and reference region, identify junction reads (hits to both), cluster by inferred insertion position, and build consensus junction sequences with IUPAC SNP encoding.
+**Phase 1 (Discovery):** Pool reads from all BAMs for each genomic region, assemble with SPAdes (metagenome mode), parse the assembly graph for TE-containing nodes, extend TE boundaries into reference sequence via k-mer walking, cross-validate against a gold standard catalog, and write junction files.
 
 **Phase 2 (Genotyping):** Extract diagnostic k-mers from junction sequences, scan raw FASTQs with BBDuk, and call genotypes from k-mer counts.
 
@@ -13,6 +13,7 @@ A two-phase pipeline for detecting transposable element (TE) insertions from pai
 HPC modules:
 - `samtools/1.15.1`
 - `ncbi-blast/2.13.0`
+- `SPAdes/3.15.4`
 - `python/3.10.2` with Biopython
 
 Conda:
@@ -46,7 +47,7 @@ cd /dfs7/adl/tdlong/Sarah/local_TE
 
 # 1. Edit config.sh with your BAMs, regions, and FASTQ paths
 
-# 2. Phase 1: Discover TE insertions (pool BAMs, assemble, BLAST, visualize)
+# 2. Phase 1: Discover TE insertions (pool BAMs, assemble, walk junctions)
 sbatch scripts/submit_te_analysis.sh
 # → temp_work/<region>/junction_*.fasta   (one file per TE found, per region)
 # → junctions.fa                          (Abs/Pre sequence pairs for all TEs)
@@ -58,42 +59,39 @@ sbatch scripts/submit_te_kmer_count.sh
 
 ## Phase 1: Discovery
 
-All BAMs are pooled per region. Each read is BLASTed against the TE database
-and the reference region; reads with hits to both are junction reads. These
-are clustered by inferred insertion position and a consensus is built with
-IUPAC ambiguity codes at SNP positions (≥15% minor allele frequency). Output
-is one directory per region.
+### Pipeline Sections
+
+1. **Section 1 — Extract Candidate Reads:** Pools junction-candidate reads (mate not on same chromosome) from all BAMs. Outputs `candidates_catalog.tsv` preserving sample identity and mate contig for downstream gold standard analysis.
+
+2. **Section 2 — Paired Reads + Gold Standard:** Extracts paired-end FASTQs (R1.fq, R2.fq) and reference region. Builds a **gold standard catalog** (`gold_standard.tsv`) from reads whose mates map to FBte* contigs — this tells us before any assembly which TEs are expected, approximate positions, and per-sample read counts.
+
+3. **Section 3 — SPAdes Assembly:** Assembles reads with `spades.py --meta -k 21,33,55`. We use the **assembly graph** (`assembly_graph.fastg`), not `contigs.fasta`, because the graph preserves all edges including low-coverage TE junction paths.
+
+4. **Section 4 — Find TE Junctions** (`find_te_junctions.py`):
+   - Parse graph nodes from FASTG
+   - BLAST graph nodes vs TE database and reference region
+   - Classify nodes: junction (both hits), TE-boundary (near TE terminus), TE-interior, ref-only
+   - K-mer walk from TE-boundary nodes into reference (~200bp extension)
+   - Cross-validate discovered junctions against gold standard catalog
+   - Write `junction_{type}_{N}.fasta` per junction
+
+### Gold Standard Catalog
+
+The gold standard (`gold_standard.tsv`) is built automatically as a pipeline step from Section 1 output. It summarizes reads whose mates map to FBte* contigs:
+
+```
+te_name        approx_pos  total_reads  HOULE_L1  HOULE_L2F  HOUSTON_L1F  ...
+FBte0000559    8720500     45           8          12          25
+FBte0000301    8735100     12           0          12          0
+```
+
+This provides ground truth for validating junction discovery results: which TEs should be found, approximate positions, and which populations contain them.
 
 ### Interactive Mode
 
 ```bash
 srun --pty bash
-bash scripts/run_te_assembly.sh \
-    "chr3L:8710861-8744900" \
-    "temp_work/chr3L_8710861-8744900" \
-    "/path/to/sample1.bam" \
-    "/path/to/sample2.bam"
-```
-
-### Arguments
-
-| Argument | Description | Example |
-|----------|-------------|---------|
-| `region` | Genomic region to analyze | `chr3L:8710861-8744900` |
-| `outdir` | Output directory | `temp_work/chr3L_8710861-8744900` |
-| `bam...` | One or more BAM files to pool | `/path/to/sample1.bam /path/to/sample2.bam` |
-
-### Discovery Output
-
-```
-temp_work/
-└── chr3L_8710861-8744900/
-    ├── pipeline.log
-    ├── region.fasta             # Reference region sequence
-    ├── reads.fasta              # Pooled junction reads (FASTA)
-    ├── reads_vs_te.tsv          # BLAST: reads vs TE database
-    ├── reads_vs_ref.tsv         # BLAST: reads vs reference region
-    └── junction_*.fasta         # One file per discovered insertion
+bash scripts/test_phase1.sh
 ```
 
 ### Junction File Format
@@ -102,8 +100,8 @@ Each `junction_{type}_{N}.fasta` contains 4 records, each exactly 100 bp, with t
 insertion point at position 50 (0-indexed).
 
 **Case convention:** reference-derived bases are written **lowercase**; TE-derived
-bases are written **UPPERCASE**. The case boundary in `reads_consensus` marks the
-insertion point exactly — no need to count to position 50.
+bases are written **UPPERCASE**. The case boundary in the junction record marks the
+insertion point exactly.
 
 #### The 4 Records
 
@@ -114,112 +112,46 @@ insertion point exactly — no need to count to position 50.
 aagcggcgcacacgggtggtggtctgctgggagacaccctcctgctcggacagctggcggcggtagatgttgatcttggcagtggacttgtccagcgcgt
 ```
 
-100 bp of the reference genome centered on the insertion site. Position 50 is
-the insertion point. This is what the chromosome looks like with **no TE** — the
-sequence a homozygous wildtype individual would have. All lowercase because it is
-entirely reference sequence. The genomic coordinates of this window (`[start:end]`),
-the insertion coordinate, and the TE name are encoded in the header.
+100 bp of the reference genome centered on the insertion site. All lowercase
+(entirely reference sequence). The genomic coordinates, insertion coordinate, and
+TE name are encoded in the header.
 
 **Record 2 — REF (duplicate)**
 
-```
->REF
-aagcggcgcacacgggtggtggtctgctgggagacaccctcctgctcggacagctggcggcggtagatgttgatcttggcagtggacttgtccagcgcgt
-```
+Identical to WT_REF. Included for alignment visualization tools.
 
-Identical to WT_REF. Included as a second reference track for alignment
-visualization tools (e.g., IGV, MUSCLE). No additional information.
-
-**Record 3 — reads_consensus (presence allele)**
+**Record 3 — walked_junction (presence allele)**
 
 ```
->reads_consensus_right_8
-NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNCCCTCCTGCTCGGacagctggcggcggtagatgttgatcttggcagtggacttgtccagcgcgt
+>walked_junction_right_0
+CCCTCCTGCTCGGCCATGCTACGTACGTACGTACGTACGTACGTACGTAcagctggcggcggtagatgttgatcttggcagtggacttgtccagcgcgt
 ```
 
-Consensus built from junction reads — reads that have sequence matching
-**both** the TE database and the reference region. This represents the chromosome
-**with the TE inserted**.
-
-- **UPPERCASE bases:** TE-derived sequence (positions 0–49 for RIGHT, 50–99 for LEFT).
-- **lowercase bases:** Reference-derived sequence (the shared flanking region).
-- **IUPAC ambiguity codes** (R, Y, W, S, K, M, …): A SNP position where ≥ 2 reads
-  carry the minor allele at ≥ 15% frequency. These capture multiple TE-bearing
-  haplotypes in a pooled population sample. IUPAC codes follow the same case rule
-  as the bases around them. Phase 2 expands each IUPAC k-mer into all concrete
-  variants so every haplotype is counted.
-- **N (uppercase, in TE half):** Position filled from the **canonical TE sequence**
-  in the database (see below). After read-based consensus building, any N positions
-  in the TE half are replaced with the known TE sequence oriented correctly for the
-  junction. The log reports `TE_cov=14/50` (read-supported bases before fill) and
-  `filled=50/50` (total non-N bases after fill) and `can=36` (positions from
-  canonical). If the canonical TE is not in the database for this TE name, N's
-  remain.
+Junction sequence discovered from SPAdes graph node + k-mer walk. UPPERCASE = TE-derived
+bases, lowercase = reference-derived bases.
 
 **Record 4 — TE canonical sequence**
 
 ```
 >FBte0000559
-CGAGCGGAAAGACAGCAATTTTGGCCGTCACCAAAAAAGTGGCTGCATAGTGCCAAACCAATGTATGGCCGTTACGCATCTTGTTATTCTAGTGTCTTTG  (all uppercase)
+CGAGCGGAAAGACAGCAATTTTGGCCGTCACCAAAAAAGTGGCTGCATAGTGCCAAACCAATGTATGGCCGTTACGCATCTTGTTATTCTAGTGTCTTTG
 ```
 
-100 bp of the canonical TE sequence from the TE database. Compare the non-N bases
-in the TE half of reads_consensus against this record to confirm TE identity and
-orientation. For a RIGHT junction this is the **end** of the TE; for a LEFT junction
-this is the **start** of the TE.
-
----
+100 bp of the canonical TE sequence from the database for comparison.
 
 #### LEFT vs. RIGHT Junction Types
 
-The type tells you which end of the TE is captured and which side of the
-junction is the reference flank:
-
 ```
 RIGHT junction (type=right):
-  Read layout:   [--- TE end (50 bp) ---][--- ref right flank (50 bp) ---]
-  Position:       0                     50                              99
-  reads_consensus: TE bases (read+canon)  |  matches WT_REF from pos 50
-  WT_REF:          ref left flank         |  ref right flank
+  Sequence:   [--- TE end (50 bp) ---][--- ref right flank (50 bp) ---]
+  Position:    0                     50                              99
+  Case:        UPPERCASE              lowercase
 
 LEFT junction (type=left):
-  Read layout:   [--- ref left flank (50 bp) ---][--- TE start (50 bp) ---]
-  Position:       0                             50                        99
-  reads_consensus: matches WT_REF to pos 50     |  TE bases (read+canon)
-  WT_REF:          ref left flank               |  ref right flank
+  Sequence:   [--- ref left flank (50 bp) ---][--- TE start (50 bp) ---]
+  Position:    0                             50                        99
+  Case:        lowercase                      UPPERCASE
 ```
-
-For a complete insertion you typically get **both** a left and a right junction
-file — one for each side of the TE. Each independently confirms the same insertion
-position and TE identity.
-
----
-
-#### How to Read a Spot-check
-
-Using the right-junction example above (`insertion=chr3L:8733858, te=FBte0000559`):
-
-1. **Confirm WT_REF makes sense:** The window header says `[8733808:8733907]` —
-   that is 100 bp centered on position 8733858 (position 50 = 8733808 + 50). ✓
-
-2. **Check the TE half of reads_consensus (positions 0–49):** The first 36 positions
-   are N (reads don't reach that far into the TE). Positions 36–49 have 14 bp of
-   actual TE sequence (`TE_cov=14/50`). Compare those 14 bp against the FBte0000559
-   record — they should match the **end** of that TE sequence.
-
-3. **Check the ref half of reads_consensus (positions 50–99):** These should match
-   WT_REF from position 50 onward. In the example they are identical. ✓
-
-4. **IUPAC codes:** `SNPs=0` here means every read agreed at every covered position.
-   A few IUPAC codes (1–4) is normal in a diverse population. Many codes (> 10,
-   flagged as SKIP by the pipeline) suggests two different nearby insertions were
-   accidentally merged into one cluster.
-
-5. **TE_cov and filled:** `TE_cov=14/50` means only 14 of 50 TE-half positions were
-   covered by reads; the other 36 were filled from the canonical TE database sequence
-   (`can=36`, `filled=50/50`). The filled positions are diagnostic only if the TE
-   sequence is sufficiently unique at that location — which is usually true for the
-   TE/reference boundary but worth verifying for highly repetitive TEs.
 
 ## Building the Competitive Reference
 
@@ -229,7 +161,7 @@ After Phase 1, build `junctions.fa` from all discovered junctions:
 python scripts/build_junctions_ref.py temp_work junctions.fa
 ```
 
-This scans all `junction_*.fasta` files, extracts Abs (absence/WT_REF) and Pre (presence/JUNC) sequences, deduplicates by genomic position + TE name, and writes:
+This scans all `junction_*.fasta` files, extracts Abs (absence/WT_REF) and Pre (presence/junction) sequences, deduplicates by genomic position + TE name, and writes:
 
 - `junctions.fa` -- paired entries:
   ```
@@ -297,16 +229,6 @@ HOULE_L2F   Abs/Pre   420        180        600    abs_ratio=0.700
 sample2     Abs/Abs   550        50         600    abs_ratio=0.917
 ```
 
-## Pipeline Sections (Phase 1)
-
-1. **Read Extraction**: Pools junction-candidate reads (mate not on same chromosome) from all BAMs; extracts reference region
-2. **Read-Level Junction Discovery** (`build_junctions_from_reads.py`):
-   - BLAST reads vs TE database and vs reference region
-   - Junction reads = hits to both; infer insertion position from alignment offsets
-   - Cluster reads within ±20bp; skip clusters below `--min-support` (default 3)
-   - Build 100bp consensus anchored at TE boundary; encode IUPAC at SNP positions
-   - Write `junction_{type}_{N}.fasta` per cluster
-
 ## Files
 
 ```
@@ -319,47 +241,33 @@ local_TE/
 └── scripts/
     ├── submit_te_analysis.sh            # Phase 1 SLURM wrapper
     ├── run_te_assembly.sh               # Phase 1 main pipeline
-    ├── build_junctions_from_reads.py    # Phase 1 read-level junction discovery
+    ├── find_te_junctions.py             # Phase 1 graph + k-mer walk discovery
     ├── build_junctions_ref.py           # Bridge: build competitive reference
     ├── submit_te_kmer_count.sh          # Phase 2 SLURM orchestrator
     ├── run_te_kmer_count.sh             # Phase 2 BBDuk per-sample
     ├── extract_junction_kmers.py        # Phase 2 k-mer extraction
-    └── genotype_from_counts.py          # Phase 2 genotyping
+    ├── genotype_from_counts.py          # Phase 2 genotyping
+    └── archive/
+        ├── build_junctions_from_reads.py  # Previous read-level approach
+        └── run_te_assembly_spades.sh      # Previous SPAdes-only approach
 ```
-
-## Future Improvements
-
-### Insert-size guided junction spanning reads (Phase 1)
-
-The current approach fills N's in the TE half with canonical TE sequence. A more principled
-alternative would recover reads that physically span the junction but were not captured as
-junction reads:
-
-1. **Round 1 (current):** identify the insertion position and TE from junction reads.
-2. **Round 2:** scan the BAM for reads where (a) R1 maps uniquely to the reference within
-   ~insert_size bp of the insertion point and points **toward** the insertion, and (b) R2 is
-   unmapped or maps poorly. Given (a), it is almost certain that R2 spans the junction. Extract
-   these R2 reads and incorporate them into the consensus before building junction files.
-
-This would produce read-supported sequence for the full TE half rather than canonical fill,
-capturing real sequence variation at the TE/reference boundary (e.g. TSDs). It requires
-knowing the insert size distribution from the BAM (`samtools stats`) and an additional BAM
-pass per region. Estimated: ~300 additional lines of shell + Python.
 
 ## Troubleshooting
 
 **No junction files produced (Phase 1):**
-- Check that input BAMs have reads in the specified region
-- Verify the region contains a TE insertion
-- Inspect `reads_vs_te.tsv` and `reads_vs_ref.tsv` in the output directory;
-  if either is empty, increase the region size or lower the e-value threshold
-- Reduce `--min-support` if coverage is very low (default 3)
+- Check `gold_standard.tsv` — if empty, no candidate reads with FBte* mates were found
+- Inspect `assembly_graph.fastg` — if empty/missing, SPAdes assembly failed
+- Check `nodes_vs_te.tsv` — if empty, no graph nodes matched TEs
+- If TE-boundary nodes exist but walks fail, try lower `--min-vote-frac`
+- Try per-k-value graphs: `K21/`, `K33/`, `K55/` may have junctions the main graph lost
+
+**SPAdes fails or produces empty graph:**
+- Check `spades.log` for errors
+- Ensure R1.fq and R2.fq are properly paired
+- Try with fewer reads or a smaller k range
 
 **No k-mer matches (Phase 2):**
 - Check that FASTQ files are correct for the samples
 - Verify `junctions.fa` contains the expected Abs/Pre pairs
 - Inspect `abs_kmers.fa` / `pre_kmers.fa` to confirm diagnostic k-mers were extracted
 - Check BBDuk stats files for total read counts
-
-**Missing metadata in junction headers:**
-- Ensure Phase 1 was run with the updated `build_te_alignment.py` that embeds `insertion=` and `te=` in WT_REF headers

@@ -50,40 +50,61 @@ LOG="$TEST_OUTDIR/pipeline.log"
 echo ""
 echo "=== Summary ==="
 
-# Read/BLAST/cluster counts
-grep -E "^  (R1\.fq|Paired:|Total candidates:|Found [0-9]+ junction|raw clusters)" \
+# Read extraction counts
+grep -E "^  (R1\.fq|Paired:|Total candidates:|Catalog entries:)" \
     "$LOG" 2>/dev/null || true
-grep -E "^Step [12]:" "$LOG" 2>/dev/null || true
-grep -E "raw clusters" "$LOG" 2>/dev/null || true
+
+# Gold standard catalog
+echo ""
+echo "Gold standard:"
+grep -E "^Gold standard reads" "$LOG" 2>/dev/null || true
+grep -A 100 "^Gold standard catalog:" "$LOG" 2>/dev/null | \
+    head -20 || echo "  (none)"
+
+# SPAdes assembly
+echo ""
+echo "Assembly:"
+grep -E "^(Assembly graph:|Contigs:|  Assembly graph already|WARNING:)" \
+    "$LOG" 2>/dev/null || true
+
+# Graph node classification
+grep -E "Classification:" "$LOG" 2>/dev/null || true
+
+# K-mer walk stats
+echo ""
+echo "K-mer walk:"
+grep -E "^  (Indexed|.*walked.*into reference)" "$LOG" 2>/dev/null || true
+grep -E "Total junction candidates" "$LOG" 2>/dev/null || true
+grep -E "After dedup" "$LOG" 2>/dev/null || true
 
 echo ""
-echo "Junction results (OK=written  SKIP=too many SNPs):"
+echo "Junction results (OK=written  SKIP=skipped  MISSING=expected but not found):"
 echo ""
-printf "  %-6s  %-32s  %-20s  %-14s  %5s  %5s  %8s  %8s  %4s\n" \
-    STATUS FILE INS_POS TE READS SNPs TE_COV FILLED CAN
-printf "  %-6s  %-32s  %-20s  %-14s  %5s  %5s  %8s  %8s  %4s\n" \
-    "------" "------" "-------" "--" "-----" "----" "------" "------" "---"
+printf "  %-9s  %-32s  %-20s  %-14s  %s\n" \
+    STATUS FILE INS_POS TE SOURCE
+printf "  %-9s  %-32s  %-20s  %-14s  %s\n" \
+    "--------" "------" "-------" "--" "------"
 
-grep -E "^  (OK|SKIP)" "$LOG" 2>/dev/null | \
+grep -E "^  (OK|SKIP|MISSING|VALIDATED|SUSPECT)" "$LOG" 2>/dev/null | \
 while IFS= read -r line; do
     status=$(echo "$line"  | awk '{print $1}')
     file=$(echo "$line"    | awk '{print $2}')
     ins=$(echo "$line"     | grep -oP 'ins=\S+')
     te=$(echo "$line"      | grep -oP 'te=\S+')
-    reads=$(echo "$line"   | grep -oP 'reads=\K[0-9]+')
-    snps=$(echo "$line"    | grep -oP 'SNPs=\K[0-9]+')
-    tecov=$(echo "$line"   | grep -oP 'TE_cov=\S+')
-    filled=$(echo "$line"  | grep -oP 'filled=\S+')
-    can=$(echo "$line"     | grep -oP 'can=\K[0-9]+')
-    printf "  %-6s  %-32s  %-20s  %-14s  %5s  %5s  %8s  %8s  %4s\n" \
-        "$status" "$file" "${ins#ins=}" "${te#te=}" "$reads" "$snps" \
-        "${tecov#TE_cov=}" "${filled#filled=}" "${can:-0}"
+    source=$(echo "$line"  | grep -oP 'source=\S+')
+    gold=$(echo "$line"    | grep -oP 'gold=\S+')
+    printf "  %-9s  %-32s  %-20s  %-14s  %s  %s\n" \
+        "$status" "$file" "${ins#ins=}" "${te#te=}" "${source#source=}" "${gold}"
 done || echo "  (none)"
 
 echo ""
 n_ok=$(grep -c "^  OK" "$LOG" 2>/dev/null || echo 0)
-n_skip=$(grep -c "^  SKIP" "$LOG" 2>/dev/null || echo 0)
-echo "  Written: $n_ok    Skipped (SNPs>max): $n_skip"
+n_missing=$(grep -c "^  MISSING" "$LOG" 2>/dev/null || echo 0)
+echo "  Written: $n_ok    Missing (gold standard): $n_missing"
+
+# Final summary line from find_te_junctions.py
+grep -E "^Phase 1 \(graph" "$LOG" 2>/dev/null || true
+grep -E "^  Validated:" "$LOG" 2>/dev/null || true
 
 # ------------------------------------------------------------------
 # Show first written junction file as a spot-check
