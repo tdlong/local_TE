@@ -144,9 +144,16 @@ def find_node_overlap(seq_a, seq_b, min_ov=10, max_ov=60):
 
 
 def write_nodes_fasta(nodes, out_path):
-    """Write graph nodes as FASTA for BLAST."""
+    """Write graph nodes as FASTA for BLAST.
+
+    Skips prime (') entries — these are reverse complements of existing
+    edges and would produce duplicate BLAST hits.  BLAST searches both
+    strands internally so the forward copy is sufficient.
+    """
     with open(out_path, 'w') as f:
         for name, seq in nodes.items():
+            if name.endswith("'"):
+                continue
             f.write(f">{name}\n{seq}\n")
 
 
@@ -795,21 +802,39 @@ def main():
     print(f"\n  Total junction candidates: {len(junction_candidates)}")
 
     # ------------------------------------------------------------------
-    # Deduplicate: if multiple nodes produce the same TE + position (±20bp)
-    # + side, keep the one from the better source (junction_node > kmer_walk)
+    # Deduplicate: merge candidates at the same position (±20bp) + side,
+    # regardless of TE name (related TE families can BLAST to different
+    # database entries for the same physical insertion).
+    # Priority: junction_node > kmer_walk > graph_edge; ties broken by
+    # BLAST alignment length.
     # ------------------------------------------------------------------
-    junction_candidates.sort(key=lambda c: (c['te_name'], c['side'], c['genomic_pos']))
+    source_rank = {'junction_node': 0, 'kmer_walk': 1, 'graph_edge': 2}
+    junction_candidates.sort(key=lambda c: (c['side'], c['genomic_pos']))
     deduped = []
     for cand in junction_candidates:
         merged = False
-        for existing in deduped:
-            if (existing['te_name'] == cand['te_name'] and
-                existing['side'] == cand['side'] and
+        for i, existing in enumerate(deduped):
+            if (existing['side'] == cand['side'] and
                 abs(existing['genomic_pos'] - cand['genomic_pos']) <= 20):
-                # Keep the one from a junction node if available
-                if cand['source'] == 'junction_node' and existing['source'] != 'junction_node':
-                    deduped.remove(existing)
-                    deduped.append(cand)
+                # Same physical insertion — keep the better one
+                cand_rank = source_rank.get(cand['source'], 9)
+                exist_rank = source_rank.get(existing['source'], 9)
+                cand_len = cand['te_hit']['length']
+                exist_len = existing['te_hit']['length']
+                if (cand_rank < exist_rank or
+                    (cand_rank == exist_rank and cand_len > exist_len)):
+                    if existing['te_name'] != cand['te_name']:
+                        print(f"  Dedup: {cand['te_name']} replaces "
+                              f"{existing['te_name']} at "
+                              f"{chrom}:{cand['genomic_pos']} "
+                              f"(longer BLAST: {cand_len} vs {exist_len})")
+                    deduped[i] = cand
+                else:
+                    if existing['te_name'] != cand['te_name']:
+                        print(f"  Dedup: {cand['te_name']} dropped in "
+                              f"favour of {existing['te_name']} at "
+                              f"{chrom}:{existing['genomic_pos']} "
+                              f"(BLAST: {exist_len} vs {cand_len})")
                 merged = True
                 break
         if not merged:
