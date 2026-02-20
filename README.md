@@ -4,12 +4,7 @@ A two-phase pipeline for detecting transposable element (TE) insertions from pai
 
 ## Overview
 
-**Phase 1 (Discovery):** Pool reads from all BAMs for each genomic region, assemble with SPAdes (metagenome mode), parse the assembly graph for TE-containing nodes, and write junction files. Three approaches are used to extract junctions:
-1. **Junction nodes** — graph nodes that already contain both TE and reference sequence
-2. **K-mer walking** — extend TE nodes into reference using a read k-mer index
-3. **Graph edge tracing** — follow FASTG connectivity from TE nodes to reference neighbors
-
-Results are cross-validated against a gold standard catalog built from BAM mate-pair info.
+**Phase 1 (Discovery):** Pool reads from all BAMs for each genomic region, assemble with SPAdes (metagenome mode), parse the assembly graph for TE-containing nodes, extract junction sequences, validate them, and build `junctions.fa`.
 
 **Phase 2 (Genotyping):** Extract diagnostic k-mers from junction sequences, scan raw FASTQs with BBDuk, and call genotypes from k-mer counts.
 
@@ -37,37 +32,53 @@ cd /dfs7/adl/tdlong/Sarah/local_TE
 
 # 2. Phase 1: Discover TE insertions → junctions.fa
 sbatch scripts/submit_te_analysis.sh
-# → junctions.fa + junctions_metadata.tsv
 
-# 3. Review junctions.fa, then Phase 2: Genotype via k-mer counting
+# 3. Review junctions.fa before proceeding
 cat junctions.fa
+
+# 4. Phase 2: Genotype via k-mer counting (~1 hour)
 sbatch scripts/submit_te_kmer_count.sh
-# → kmer_work/genotype_results.tsv        (one row per sample × TE junction)
+# → kmer_work/genotype_results.tsv
 ```
 
 ## Phase 1: Discovery
 
-### Pipeline Sections
+### How It Works
 
-1. **Section 1 — Extract Candidate Reads:** Pools junction-candidate reads (mate not on same chromosome) from all BAMs. Outputs `candidates_catalog.tsv` preserving sample identity and mate contig.
+1. **Extract candidate reads** from all BAMs — reads whose mates map to a different chromosome. Outputs `candidates_catalog.tsv` preserving sample identity and mate contig.
 
-2. **Section 2 — Paired Reads + Gold Standard:** Extracts paired-end FASTQs (R1.fq, R2.fq) and reference region. Builds a **gold standard catalog** (`gold_standard.tsv`) from reads whose mates map to FBte* contigs — this tells us before any assembly which TEs are expected, approximate positions, and per-sample read counts.
+2. **Build gold standard catalog** from reads whose mates map to FBte* contigs. This tells us before any assembly which TEs to expect, their approximate positions, and which samples contain them.
 
-3. **Section 3 — SPAdes Assembly:** Assembles reads with `spades.py --meta -k 21,33,55`. We use the **assembly graph** (`assembly_graph.fastg`), not `contigs.fasta`, because the graph preserves all edges including low-coverage TE junction paths.
+3. **SPAdes assembly** (`--meta -k 21,33,55`). We use the **assembly graph** (`assembly_graph.fastg`), not `contigs.fasta`, because the graph preserves all paths including low-coverage TE junctions.
 
-4. **Section 4 — Find TE Junctions** (`find_te_junctions.py`):
-   - Parse graph nodes and edge connectivity from FASTG
+4. **Find TE junctions** (`find_te_junctions.py`):
    - BLAST graph nodes vs TE database and reference region
    - Classify nodes: junction (both hits), TE-boundary, TE-interior, ref-only
-   - **Junction nodes**: extract 100bp junction directly from nodes with both TE and ref hits
-   - **K-mer walk**: extend TE boundary/interior nodes into reference via read k-mer index
-   - **Graph edges**: concatenate TE nodes with adjacent reference neighbors from FASTG connectivity
-   - Cross-validate discovered junctions against gold standard catalog
+   - Extract junctions from junction nodes; attempt k-mer walks and graph edge tracing for the rest
+   - Validate each junction and deduplicate by position
    - Write `junction_{type}_{N}.fasta` per junction
+
+5. **Build competitive reference** (`build_junctions_ref.py`): collect all junction files across regions, deduplicate by position, write `junctions.fa`.
+
+### Junction Discovery: Three Approaches
+
+**Junction nodes** are the primary source. These are graph nodes that BLAST to both a TE and the reference region. The junction point is determined from the **reference BLAST boundary** — where the reference alignment begins (right junction) or ends (left junction) in the node. This ensures the junction extraction point and the genomic position are derived from the same source.
+
+**K-mer walking** attempts to extend TE-only nodes into reference using a read k-mer index. This can recover junctions not present as single graph nodes, though in practice SPAdes error-correction often prevents walks from succeeding.
+
+**Graph edge tracing** follows FASTG connectivity from TE nodes to adjacent reference nodes. Useful when the junction spans two nodes connected by a graph edge.
+
+### Built-in Correctness Check
+
+Each junction contains a reference half and a TE half. The reference half of the presence allele (Pre) must match the corresponding half of the absence allele (Abs) — both are the same stretch of reference genome. If they don't match (>2 mismatches), the junction point is wrong and the junction is **rejected**. This catches algorithmic errors rather than papering over them.
+
+### Deduplication
+
+Related TE families can share sequence, causing a single physical insertion to BLAST to multiple TE database entries. Junctions are deduplicated by **(position, side)** regardless of TE name — same position means same insertion. The best BLAST hit is kept.
 
 ### Gold Standard Catalog
 
-The gold standard (`gold_standard.tsv`) is built automatically from BAM mate-pair info. It summarizes reads whose mates map to FBte* contigs:
+The gold standard (`gold_standard.tsv`) is built from BAM mate-pair info:
 
 ```
 te_name        approx_pos  total_reads  HOULE_L1F  HOULE_L2F  HOUSTON_L1F  ...
@@ -75,7 +86,23 @@ FBte0000626    8711446     14           0          14          0
 FBte0001399    8738348     2            1          1           0
 ```
 
-This provides ground truth for validating junction discovery. TEs with only 1-2 supporting reads are often not assemblable. The gold standard only counts FBte* mates; TEs supported by discordant mates to other chromosomes may also be discovered as "SUSPECT" junctions.
+This provides ground truth for validating junction discovery. Notes:
+- TEs with only 1-2 supporting reads are often not assemblable
+- The gold standard only counts FBte* mates; other discordant mates may produce "SUSPECT" junctions
+- TE insertions can be truncated/incomplete — a mate mapping deep into a canonical TE doesn't mean the full TE is inserted
+
+### Junction File Format
+
+Each `junction_{type}_{N}.fasta` contains 4 records, each 100bp, with the insertion point at position 50 (0-indexed).
+
+**Case convention:** reference bases are **lowercase**; TE bases are **UPPERCASE**. The case boundary marks the insertion point.
+
+```
+RIGHT junction:  [UPPERCASE TE end 50bp][lowercase ref right flank 50bp]
+LEFT  junction:  [lowercase ref left flank 50bp][UPPERCASE TE start 50bp]
+```
+
+Not all TEs produce both left and right junctions. A single junction is sufficient for genotyping. When both are found, their positions should differ by ~4-8bp (target site duplication).
 
 ### Interactive Testing
 
@@ -84,45 +111,6 @@ srun --pty bash
 bash scripts/test_phase1.sh          # runs first region from config.sh
 bash scripts/summarize_phase1.sh     # dumps diagnostics to phase1_summary.txt
 ```
-
-### Junction File Format
-
-Each `junction_{type}_{N}.fasta` contains 4 records, each ~100 bp, with the
-insertion point at position 50 (0-indexed).
-
-**Case convention:** reference-derived bases are written **lowercase**; TE-derived
-bases are written **UPPERCASE**. The case boundary marks the insertion point.
-
-#### The 4 Records
-
-1. **WT_REF** — 100bp reference (absence allele), all lowercase
-2. **REF** — duplicate of WT_REF
-3. **walked_junction** — 100bp junction (presence allele), case-encoded
-4. **TE canonical** — 100bp of canonical TE sequence for comparison
-
-#### LEFT vs. RIGHT Junction Types
-
-```
-RIGHT junction (type=right):
-  Sequence:   [--- TE end (50 bp) ---][--- ref right flank (50 bp) ---]
-  Case:        UPPERCASE              lowercase
-
-LEFT junction (type=left):
-  Sequence:   [--- ref left flank (50 bp) ---][--- TE start (50 bp) ---]
-  Case:        lowercase                      UPPERCASE
-```
-
-Not all TEs produce both left and right junctions. A single junction is sufficient for genotyping. When both are found, their positions should differ by ~4-8bp (target site duplication).
-
-## Building the Competitive Reference
-
-After Phase 1, build `junctions.fa` from all discovered junctions:
-
-```bash
-python scripts/build_junctions_ref.py temp_work junctions.fa
-```
-
-This scans all `junction_*.fasta` files across regions, extracts Abs/Pre pairs, deduplicates, and writes `junctions.fa` + `junctions_metadata.tsv`.
 
 ## Phase 2: Genotyping via K-mer Counting
 
@@ -150,39 +138,35 @@ sbatch scripts/submit_te_kmer_count.sh
 
 ```
 local_TE/
-├── README.md
 ├── config.sh                            # Edit this: BAMs, regions, FASTQs, refs
-├── junctions.fa                         # Built by build_junctions_ref.py
+├── junctions.fa                         # Built by Phase 1
 ├── junctions_metadata.tsv
 └── scripts/
-    ├── submit_te_analysis.sh            # Phase 1 SLURM wrapper
-    ├── run_te_assembly.sh               # Phase 1 pipeline (SPAdes + junction finding)
-    ├── find_te_junctions.py             # Phase 1 junction discovery (graph + walk + edges)
-    ├── build_junctions_ref.py           # Build competitive reference from junctions
+    ├── submit_te_analysis.sh            # Phase 1 SLURM wrapper (includes build_junctions)
+    ├── run_te_assembly.sh               # Phase 1 per-region pipeline
+    ├── find_te_junctions.py             # Junction discovery (graph + walk + edges)
+    ├── build_junctions_ref.py           # Collect and deduplicate junctions
     ├── test_phase1.sh                   # Interactive Phase 1 test
-    ├── summarize_phase1.sh              # Diagnostic summary dump
+    ├── summarize_phase1.sh              # Diagnostic summary
     ├── submit_te_kmer_count.sh          # Phase 2 SLURM orchestrator
     ├── run_te_kmer_count.sh             # Phase 2 BBDuk per-sample
     ├── extract_junction_kmers.py        # Phase 2 k-mer extraction
-    ├── genotype_from_counts.py          # Phase 2 genotyping
-    └── archive/
-        ├── build_junctions_from_reads.py  # Previous read-level approach
-        └── run_te_assembly_spades.sh      # Previous SPAdes-only approach
+    └── genotype_from_counts.py          # Phase 2 genotyping
 ```
 
 ## Troubleshooting
 
-**No junction files produced (Phase 1):**
+**No junction files produced:**
 - Check `gold_standard.tsv` — if empty, no candidate reads with FBte* mates were found
 - Inspect `assembly_graph.fastg` — if empty/missing, SPAdes assembly failed
 - Check `nodes_vs_te.tsv` — if empty, no graph nodes matched TEs
 - TEs with only 1-2 gold standard reads are often not assemblable
 
-**SPAdes fails or produces empty graph:**
-- Check `spades.log` for errors
-- Ensure R1.fq and R2.fq are properly paired
+**Junctions rejected by correctness check:**
+- The ref half of the Pre didn't match the Abs — junction point determination is wrong
+- Check the BLAST hits in `nodes_vs_te.tsv` and `nodes_vs_ref.tsv` for the offending node
 
 **No k-mer matches (Phase 2):**
-- Verify `junctions.fa` contains the expected Abs/Pre pairs
+- Verify `junctions.fa` contains expected Abs/Pre pairs
 - Inspect `abs_kmers.fa` / `pre_kmers.fa` to confirm diagnostic k-mers were extracted
 - Check BBDuk stats files for total read counts
