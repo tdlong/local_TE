@@ -611,13 +611,17 @@ def main():
 
         # Determine L/R from which half is TE (in the now-oriented junction)
         # RIGHT: [TE end (0-49) | ref right flank (50-99)]
+        #   ins_region = where ref begins = min(sstart, send)
         # LEFT:  [ref left flank (0-49) | TE start (50-99)]
+        #   ins_region = one past where ref ends = max(sstart, send) + 1
+        #   The +1 is needed because the Abs is centered at ins_region,
+        #   and for a left junction the TE begins one past the last ref base.
         if te_is_left_in_node:
             side = 'right'
             ins_region = min(ref_hit['sstart'], ref_hit['send'])
         else:
             side = 'left'
-            ins_region = max(ref_hit['sstart'], ref_hit['send'])
+            ins_region = max(ref_hit['sstart'], ref_hit['send']) + 1
 
         genomic_pos = region_start + ins_region - 1
 
@@ -701,7 +705,7 @@ def main():
             if candidate_type == 'right':
                 ins_region = min(ref_hit_walk['sstart'], ref_hit_walk['send'])
             else:
-                ins_region = max(ref_hit_walk['sstart'], ref_hit_walk['send'])
+                ins_region = max(ref_hit_walk['sstart'], ref_hit_walk['send']) + 1
             genomic_pos = region_start + ins_region - 1
 
             print(f"  {node_id} walk_{walk_dir}: walked {extension_len}bp, "
@@ -784,7 +788,7 @@ def main():
             if candidate_type == 'right':
                 ins_region = min(ref_hit['sstart'], ref_hit['send'])
             else:
-                ins_region = max(ref_hit['sstart'], ref_hit['send'])
+                ins_region = max(ref_hit['sstart'], ref_hit['send']) + 1
             genomic_pos = region_start + ins_region - 1
 
             print(f"  {te_node}→{neighbor}: graph edge junction "
