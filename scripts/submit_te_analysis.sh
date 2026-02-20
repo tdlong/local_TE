@@ -22,9 +22,11 @@ for bam in "${BAMS[@]}"; do
 done
 
 # Process each region, pooling reads from ALL BAMs
+REGION_DIRS=()
 for region in "${REGIONS[@]}"; do
     region_safe="${region//:/_}"
     outdir="temp_work/${region_safe}"
+    REGION_DIRS+=("$outdir")
 
     echo "Processing region: $region"
     echo "  Pooling ${#BAMS[@]} BAMs"
@@ -38,8 +40,9 @@ for region in "${REGIONS[@]}"; do
 done
 
 echo "=== Building competitive reference from all junctions ==="
+echo "  Directories: ${REGION_DIRS[*]}"
 module load python/3.10.2
-python scripts/build_junctions_ref.py temp_work junctions.fa
+python scripts/build_junctions_ref.py junctions.fa "${REGION_DIRS[@]}"
 
 echo ""
 echo "=== Phase 1 Complete ==="

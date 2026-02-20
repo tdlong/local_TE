@@ -2,12 +2,16 @@
 """
 build_junctions_ref.py
 
-Scan all junction_*.fasta files from the discovery phase, extract Abs/Pre
-sequence pairs, deduplicate, and write a combined junctions.fa for the
-competitive alignment in Phase 2.
+Collect junction_*.fasta files from specified directories, extract Abs/Pre
+sequence pairs, validate, deduplicate, and write junctions.fa for Phase 2.
 
 Usage:
-    python build_junctions_ref.py <temp_work_dir> <output_junctions.fa>
+    python build_junctions_ref.py <output_junctions.fa> <dir1> [dir2 dir3 ...]
+
+Each directory is searched for junction_*.fasta files (non-recursive).
+Only directories explicitly listed are searched — no wildcards over
+parent directories — so the caller controls exactly which results
+are included.
 
 Input:
     junction_*.fasta files with 4 sequences each:
@@ -43,27 +47,31 @@ def parse_wt_ref_header(description):
 
 def main():
     if len(sys.argv) < 3:
-        print(__doc__)
+        print("Usage: build_junctions_ref.py <output.fa> <dir1> [dir2 ...]")
         sys.exit(1)
 
-    work_dir = sys.argv[1]
-    output_fa = sys.argv[2]
+    output_fa = sys.argv[1]
+    search_dirs = sys.argv[2:]
 
     # Derive metadata TSV name
     base, ext = os.path.splitext(output_fa)
     output_tsv = base + "_metadata.tsv"
 
-    # Find all junction files
-    junction_files = sorted(glob.glob(os.path.join(work_dir, '*/junction_*.fasta')))
+    # Find junction files in the specified directories only
+    junction_files = []
+    for d in search_dirs:
+        found = sorted(glob.glob(os.path.join(d, 'junction_*.fasta')))
+        junction_files.extend(found)
 
     if not junction_files:
-        print(f"No junction files found in {work_dir}/*/junction_*.fasta")
+        print(f"No junction files found in: {' '.join(search_dirs)}")
         sys.exit(1)
 
-    print(f"Found {len(junction_files)} junction files")
+    print(f"Found {len(junction_files)} junction files in "
+          f"{len(search_dirs)} directories")
 
     # Collect all junctions
-    # key: (insertion_pos, te_name) -> data dict
+    # key: (insertion_pos, type) -> data dict
     junctions = {}
 
     for jfile in junction_files:
@@ -73,9 +81,9 @@ def main():
             continue
 
         wt_ref_rec = records[0]   # WT_REF (absence allele)
-        # records[1] is REF (partial, with gaps)
+        # records[1] is REF (duplicate)
         junc_rec = records[2]     # Junction contig (presence allele)
-        te_rec = records[3]       # TE sequence (partial, with gaps)
+        te_rec = records[3]       # TE sequence
 
         # Parse metadata from header
         metadata = parse_wt_ref_header(wt_ref_rec.description)
@@ -93,11 +101,24 @@ def main():
         abs_seq = str(wt_ref_rec.seq).replace('-', '')
         pre_seq = str(junc_rec.seq).replace('-', '')
 
+        # Validate: reference half of Pre must match Abs
+        half = len(abs_seq) // 2
+        if jtype == 'right':
+            abs_ref = abs_seq[half:].upper()
+            pre_ref = pre_seq[half:].upper()
+        else:
+            abs_ref = abs_seq[:half].upper()
+            pre_ref = pre_seq[:half].upper()
+
+        mismatches = sum(1 for a, b in zip(abs_ref, pre_ref) if a != b)
+        if mismatches > 2:
+            print(f"  REJECT {jfile}: {insertion} {te_name} ({jtype}) — "
+                  f"ref half has {mismatches}/{half} mismatches vs Abs")
+            continue
+
         # Dedup key: insertion position + junction type (NOT TE name).
         # Different TE database entries can match the same physical
         # insertion — they should not produce separate junctions.
-        # Keep the first one encountered (find_te_junctions.py already
-        # picks the best TE hit during its own dedup pass).
         key = (insertion, jtype)
 
         if key in junctions:
@@ -117,20 +138,20 @@ def main():
             'contig': junc_rec.id,
         }
 
-        print(f"  {insertion} {te_name} ({jtype}) - Abs:{len(abs_seq)}bp Pre:{len(pre_seq)}bp")
+        print(f"  {insertion} {te_name} ({jtype}) - "
+              f"Abs:{len(abs_seq)}bp Pre:{len(pre_seq)}bp")
 
     if not junctions:
         print("No valid junctions found!")
         sys.exit(1)
 
     # Write junctions.fa and metadata TSV
-    # Naming convention: chr3L_8711446_FBte0000626_Abs / _Pre
     with open(output_fa, 'w') as fa, open(output_tsv, 'w') as tsv:
-        tsv.write("junction_id\tinsertion\tte_name\ttype\tcontig\tsource_dir\tabs_len\tpre_len\n")
+        tsv.write("junction_id\tinsertion\tte_name\ttype\tcontig\t"
+                  "source_dir\tabs_len\tpre_len\n")
 
         for (insertion, jtype), data in sorted(junctions.items()):
             te_name = data['te_name']
-            # Create a safe ID: chr3L:8711446 + type -> chr3L_8711446_right
             safe_insertion = insertion.replace(':', '_')
             junction_id = f"{safe_insertion}_{te_name}_{jtype}"
 
