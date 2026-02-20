@@ -93,14 +93,17 @@ def main():
         abs_seq = str(wt_ref_rec.seq).replace('-', '')
         pre_seq = str(junc_rec.seq).replace('-', '')
 
-        # Dedup key: insertion position + TE name + junction type
-        # Include type so left and right junctions at the same insertion
-        # both get their own entry (they span different TE ends and produce
-        # different diagnostic k-mers for Phase 2).
-        key = (insertion, te_name, jtype)
+        # Dedup key: insertion position + junction type (NOT TE name).
+        # Different TE database entries can match the same physical
+        # insertion — they should not produce separate junctions.
+        # Keep the first one encountered (find_te_junctions.py already
+        # picks the best TE hit during its own dedup pass).
+        key = (insertion, jtype)
 
         if key in junctions:
-            print(f"  Duplicate: {insertion} {te_name} ({jtype}) (keeping first)")
+            existing_te = junctions[key]['te_name']
+            print(f"  Duplicate: {insertion} {te_name} ({jtype}) — "
+                  f"same position as {existing_te}, keeping first")
             continue
 
         junctions[key] = {

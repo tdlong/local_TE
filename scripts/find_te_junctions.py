@@ -584,13 +584,18 @@ def main():
         ref_mid = (ref_hit['qstart'] + ref_hit['qend']) / 2
         te_is_left_in_node = te_mid < ref_mid
 
-        # Junction point: where TE and ref portions meet in the node
+        # Junction point: derived from the REF BLAST hit boundary.
+        # This ensures the extraction point and the genomic position come
+        # from the same source — the ref half of the Pre will then match
+        # the Abs (both derived from the same ref BLAST coordinates).
         if te_is_left_in_node:
-            junc_pos = te_hit['qend']
-            extract_side = 'right'  # TE left, ref right
+            # TE left, ref right → junction is where ref begins in node
+            junc_pos = ref_hit['qstart'] - 1  # 0-based
+            extract_side = 'right'
         else:
-            junc_pos = te_hit['qstart']
-            extract_side = 'left'   # ref left, TE right
+            # Ref left, TE right → junction is where ref ends in node
+            junc_pos = ref_hit['qend']  # 0-based (qend is 1-based inclusive)
+            extract_side = 'left'
 
         # Extract 100bp around junction point (orientation not yet determined)
         junc_100 = extract_junction_100bp(node_seq, junc_pos, extract_side, half)
@@ -878,6 +883,32 @@ def main():
                   f"(ins_region={ins_region})")
             continue
         abs_seq = region_seq[abs_start:abs_end]
+
+        # ----------------------------------------------------------
+        # Correctness check: the reference half of the Pre must match
+        # the corresponding half of the Abs.  If it doesn't, our
+        # junction point is wrong — reject the junction.
+        # ----------------------------------------------------------
+        if side == 'right':
+            # Pre[50:100] should be reference = Abs[50:100]
+            pre_ref_half = junc_seq[half:].upper()
+            abs_ref_half = abs_seq[half:]
+        else:
+            # Pre[0:50] should be reference = Abs[0:50]
+            pre_ref_half = junc_seq[:half].upper()
+            abs_ref_half = abs_seq[:half]
+
+        mismatches = sum(1 for a, b in zip(pre_ref_half, abs_ref_half)
+                         if a != b)
+        if mismatches > 2:
+            print(f"  REJECT {te_name} {side} at {chrom}:{genomic_pos} "
+                  f"(source={source}): ref half has {mismatches}/{half} "
+                  f"mismatches vs Abs — junction point is wrong")
+            continue
+
+        if mismatches > 0:
+            print(f"  WARN {te_name} {side} at {chrom}:{genomic_pos}: "
+                  f"ref half has {mismatches}/{half} mismatches vs Abs")
 
         # TE canonical sequence for record 4
         te_full = te_seq_dict.get(te_name, '')
