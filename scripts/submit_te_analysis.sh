@@ -37,10 +37,15 @@ for region in "${REGIONS[@]}"; do
     echo ""
 done
 
-echo "=== Phase 1 Complete ==="
-echo "Results in temp_work/"
-ls -la temp_work/*/junction_*.fasta 2>/dev/null || echo "No junction files produced"
+echo "=== Building competitive reference from all junctions ==="
+module load python/3.10.2
+python scripts/build_junctions_ref.py temp_work junctions.fa
+
 echo ""
-echo "Next steps:"
-echo "  1. Fill in SAMPLES in config.sh with FASTQ paths"
-echo "  2. sbatch scripts/submit_te_kmer_count.sh"
+echo "=== Phase 1 Complete ==="
+echo ""
+echo "Review junctions.fa before proceeding to Phase 2:"
+echo "  cat junctions.fa"
+echo ""
+echo "When satisfied, run Phase 2:"
+echo "  sbatch scripts/submit_te_kmer_count.sh"
