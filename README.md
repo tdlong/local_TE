@@ -8,6 +8,29 @@ A two-phase pipeline for detecting transposable element (TE) insertions from pai
 
 **Phase 2 (Genotyping):** Extract diagnostic k-mers from junction sequences, scan raw FASTQs with BBDuk, and call genotypes from k-mer counts.
 
+## Test Run Results
+
+End-to-end test on 2 regions (chr3L:8710861-8744900, chrX:8450000-8500000) across 6 samples (3 HOULE, 3 HOUSTON):
+
+```
+junction                              HOULE_L1  HOULE_L2F  HOULE_L3F  HOUSTON_L1F  HOUSTON_L2F  HOUSTON_L3F
+chr3L_8711446_FBte0000626_right       0.00      0.05       0.00       0.00         0.00         0.00
+chr3L_8734174_FBte0000559_left        NA        0.00       0.00       0.43         0.00         0.00
+chrX_8490354_FBte0000021_right        0.60      0.71       0.80       0.02         0.03         0.08
+```
+
+3 TE insertions discovered and genotyped, all showing population-specific frequency patterns:
+
+- **FBte0000626** (chr3L:8711446): Rare insertion at ~5% in HOULE_L2F only. Consistent with the gold standard (14 reads, all from HOULE_L2F).
+- **FBte0000559** (chr3L:8734174): Present at ~43% in HOUSTON_L1F, absent elsewhere. Only the left junction was recovered; the right junction (at 8734167, 7bp TSD) was found in earlier test runs but not in the production assembly — likely due to SPAdes graph variability between runs.
+- **FBte0000021** (chrX:8490354): Strong population differentiation — 60-80% in HOULE, 2-8% in HOUSTON.
+
+### Known Limitations
+
+- **Not all junctions are recovered.** SPAdes assembly is stochastic; low-coverage junctions may appear in some runs but not others. K-mer walks rarely succeed because SPAdes error-corrects reads, breaking the k-mer chain between assembled nodes and the original read index.
+- **Single junctions are sufficient.** Not all TEs produce both left and right junctions. A single junction provides enough diagnostic k-mers for genotyping.
+- **NA = insufficient depth.** Phase 2 reports NA when fewer than 5 total k-mers are found for a junction in a sample.
+
 ## Requirements
 
 HPC modules:
@@ -38,7 +61,7 @@ cat junctions.fa
 
 # 4. Phase 2: Genotype via k-mer counting (~1 hour)
 sbatch scripts/submit_te_kmer_count.sh
-# → kmer_work/genotype_results.tsv
+# → kmer_work/genotype_results_freq_matrix.tsv
 ```
 
 ## Phase 1: Discovery
@@ -55,26 +78,28 @@ sbatch scripts/submit_te_kmer_count.sh
    - BLAST graph nodes vs TE database and reference region
    - Classify nodes: junction (both hits), TE-boundary, TE-interior, ref-only
    - Extract junctions from junction nodes; attempt k-mer walks and graph edge tracing for the rest
-   - Validate each junction and deduplicate by position
+   - Validate each junction (ref half must match Abs) and deduplicate by position
    - Write `junction_{type}_{N}.fasta` per junction
 
-5. **Build competitive reference** (`build_junctions_ref.py`): collect all junction files across regions, deduplicate by position, write `junctions.fa`.
+5. **Build competitive reference** (`build_junctions_ref.py`): collect junction files from the directories just processed (not a wildcard), validate, deduplicate by position, write `junctions.fa`.
 
-### Junction Discovery: Three Approaches
+### Junction Discovery
 
-**Junction nodes** are the primary source. These are graph nodes that BLAST to both a TE and the reference region. The junction point is determined from the **reference BLAST boundary** — where the reference alignment begins (right junction) or ends (left junction) in the node. This ensures the junction extraction point and the genomic position are derived from the same source.
+**Junction nodes** are the primary source. These are graph nodes that BLAST to both a TE and the reference region. The junction point is determined from the **reference BLAST boundary** — where the reference alignment begins (right junction) or ends+1 (left junction) in the node. This ensures the junction extraction point and the genomic position are derived from the same source.
 
-**K-mer walking** attempts to extend TE-only nodes into reference using a read k-mer index. This can recover junctions not present as single graph nodes, though in practice SPAdes error-correction often prevents walks from succeeding.
+**K-mer walking** attempts to extend TE-only nodes into reference using a read k-mer index. In practice, SPAdes error-correction often prevents walks from succeeding because the corrected node sequences don't match the original read k-mers.
 
 **Graph edge tracing** follows FASTG connectivity from TE nodes to adjacent reference nodes. Useful when the junction spans two nodes connected by a graph edge.
 
 ### Built-in Correctness Check
 
-Each junction contains a reference half and a TE half. The reference half of the presence allele (Pre) must match the corresponding half of the absence allele (Abs) — both are the same stretch of reference genome. If they don't match (>2 mismatches), the junction point is wrong and the junction is **rejected**. This catches algorithmic errors rather than papering over them.
+Each junction's reference half (the lowercase portion) must match the corresponding half of the Abs (absence allele) — both are the same stretch of reference genome. If they don't match (>2 mismatches out of 50bp), the junction point is wrong and the junction is **rejected**. This is checked in both `find_te_junctions.py` and `build_junctions_ref.py`.
+
+This validation caught two bugs during development: an inconsistency between TE-BLAST-derived and ref-BLAST-derived junction points, and an off-by-one in left junction coordinate calculation.
 
 ### Deduplication
 
-Related TE families can share sequence, causing a single physical insertion to BLAST to multiple TE database entries. Junctions are deduplicated by **(position, side)** regardless of TE name — same position means same insertion. The best BLAST hit is kept.
+Related TE families can share sequence, causing a single physical insertion to BLAST to multiple TE database entries. Junctions are deduplicated by **(position, side)** regardless of TE name — same position means same insertion. The best BLAST hit is kept. This is enforced in both `find_te_junctions.py` (during discovery) and `build_junctions_ref.py` (during collection).
 
 ### Gold Standard Catalog
 
@@ -145,7 +170,7 @@ local_TE/
     ├── submit_te_analysis.sh            # Phase 1 SLURM wrapper (includes build_junctions)
     ├── run_te_assembly.sh               # Phase 1 per-region pipeline
     ├── find_te_junctions.py             # Junction discovery (graph + walk + edges)
-    ├── build_junctions_ref.py           # Collect and deduplicate junctions
+    ├── build_junctions_ref.py           # Collect, validate, and deduplicate junctions
     ├── test_phase1.sh                   # Interactive Phase 1 test
     ├── summarize_phase1.sh              # Diagnostic summary
     ├── submit_te_kmer_count.sh          # Phase 2 SLURM orchestrator
@@ -165,8 +190,15 @@ local_TE/
 **Junctions rejected by correctness check:**
 - The ref half of the Pre didn't match the Abs — junction point determination is wrong
 - Check the BLAST hits in `nodes_vs_te.tsv` and `nodes_vs_ref.tsv` for the offending node
+- Common causes: TE and ref BLAST hits don't cleanly abut in the node, strand handling issues
 
 **No k-mer matches (Phase 2):**
 - Verify `junctions.fa` contains expected Abs/Pre pairs
 - Inspect `abs_kmers.fa` / `pre_kmers.fa` to confirm diagnostic k-mers were extracted
 - Check BBDuk stats files for total read counts
+
+## Future Work
+
+- **Scale to more regions.** The test run used 2 regions; the pipeline is ready for genome-wide application by adding regions to `config.sh`.
+- **Recover more junctions.** The FBte0000559 right junction and FBte0000626 left junction exist but weren't recovered in the production assembly. Possible improvements: use per-k-value SPAdes graphs (K21, K33) in addition to the final merged graph, or use SPAdes error-corrected reads for the k-mer walk index.
+- **Handle truncated TE insertions.** Some TE insertions are incomplete — mate pairs mapping deep into a canonical TE don't mean the full TE is present. The gold standard catalog flags these but the pipeline doesn't yet distinguish them.
