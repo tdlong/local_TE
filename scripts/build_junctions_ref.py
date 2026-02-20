@@ -128,7 +128,8 @@ def main():
     with open(output_fa, 'w') as fa, open(output_tsv, 'w') as tsv:
         tsv.write("junction_id\tinsertion\tte_name\ttype\tcontig\tsource_dir\tabs_len\tpre_len\n")
 
-        for (insertion, te_name, jtype), data in sorted(junctions.items()):
+        for (insertion, jtype), data in sorted(junctions.items()):
+            te_name = data['te_name']
             # Create a safe ID: chr3L:8711446 + type -> chr3L_8711446_right
             safe_insertion = insertion.replace(':', '_')
             junction_id = f"{safe_insertion}_{te_name}_{jtype}"
